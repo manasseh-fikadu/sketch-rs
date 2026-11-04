@@ -5,11 +5,15 @@
 //! attributes. This module maps the subset that has a Sketch equivalent onto `Style`,
 //! `TextStyle`, `AutoLayout` and `LayoutChild`, reports the rest as ignored, and turns nodes
 //! back into CSS for `get_computed_styles` / `get_jsx`.
+//!
+//! The report is what an agent relies on to know its design landed, so a property here must
+//! either work or come back in `ignored`. Never accept one and draw something else.
 
 use crate::geom::v2;
 use crate::model::rough::{FillStyle, Rough};
 use crate::model::{
-    Align, AutoLayout, BlendMode, Color, Direction, ImageMode, Node, NodeKind, Paint, Sizing, Stop,
+    Align, AutoLayout, BlendMode, BorderSide, Color, CssAngle, Dim, Direction, Distribute, GridPos,
+    GridSpec, ImageMode, LayoutMode, Node, NodeKind, Paint, SelfAlign, Shadow, Sizing, Stop,
     TextAlign,
 };
 use serde_json::{Map, Value};
@@ -181,6 +185,154 @@ pub fn four(s: &str, font_size: f64) -> Option<[f64; 4]> {
         [a, b, c, d, ..] => [*a, *b, *c, *d],
         [] => return None,
     })
+}
+
+/// `auto`, a length or a percentage.
+pub fn dim(s: &str, font_size: f64) -> Option<Dim> {
+    let s = s.trim();
+    if s == "auto" {
+        return Some(Dim::Auto);
+    }
+    match percent(s) {
+        Some(p) => Some(Dim::Pct(p)),
+        None => length(s, font_size).map(Dim::Px),
+    }
+}
+
+/// 1–4 value shorthand that allows `auto` and percentages (margin).
+fn four_dims(s: &str, font_size: f64) -> Option<[Dim; 4]> {
+    let v: Vec<Dim> = split_ws(s)
+        .iter()
+        .map(|p| dim(p, font_size))
+        .collect::<Option<_>>()?;
+    Some(match v.as_slice() {
+        [a] => [*a; 4],
+        [a, b] => [*a, *b, *a, *b],
+        [a, b, c] => [*a, *b, *c, *b],
+        [a, b, c, d, ..] => [*a, *b, *c, *d],
+        [] => return None,
+    })
+}
+
+/// A CSS `font-weight` as a number.
+pub fn font_weight(v: &str) -> Option<u16> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "normal" => Some(400),
+        "bold" | "bolder" => Some(700),
+        "lighter" => Some(300),
+        n => n
+            .parse::<f64>()
+            .ok()
+            .filter(|w| (1.0..=1000.0).contains(w))
+            .map(|w| w as u16),
+    }
+}
+
+/// Whether a `font-family` list resolves to the one bundled family. The generic sans-serif
+/// names count, since Inter is what a sans-serif means here.
+pub fn is_inter(v: &str) -> bool {
+    let first = split_top(v, ',').first().map_or(String::new(), |f| {
+        f.trim_matches(['"', '\'']).to_ascii_lowercase()
+    });
+    matches!(
+        first.as_str(),
+        "inter" | "inter var" | "sans-serif" | "system-ui" | "ui-sans-serif" | "inherit" | ""
+    )
+}
+
+/// Apply CSS `text-transform` to characters one at a time, so text spans keep their offsets.
+pub fn transform_text(chars: &mut [char], mode: &str) {
+    let mode = mode.trim().to_ascii_lowercase();
+    let mut word_start = true;
+    for c in chars.iter_mut() {
+        let up = c.to_uppercase().next().unwrap_or(*c);
+        let low = c.to_lowercase().next().unwrap_or(*c);
+        match mode.as_str() {
+            "uppercase" => *c = up,
+            "lowercase" => *c = low,
+            "capitalize" if word_start => *c = up,
+            _ => {}
+        }
+        word_start = c.is_whitespace();
+    }
+}
+
+/// A `box-shadow` value; `none` gives an empty list.
+pub fn shadows(v: &str, font_size: f64) -> Option<Vec<Shadow>> {
+    if v.trim().eq_ignore_ascii_case("none") {
+        return Some(Vec::new());
+    }
+    split_top(v, ',')
+        .iter()
+        .map(|layer| {
+            let (mut lens, mut col, mut inset) = (Vec::new(), None, false);
+            for p in split_ws(layer) {
+                if p.eq_ignore_ascii_case("inset") {
+                    inset = true;
+                } else if let Some(l) = length(&p, font_size) {
+                    lens.push(l);
+                } else {
+                    col = Some(color(&p)?);
+                }
+            }
+            if !(2..=4).contains(&lens.len()) {
+                return None;
+            }
+            Some(Shadow {
+                x: lens[0],
+                y: lens[1],
+                blur: lens.get(2).copied().unwrap_or(0.0).max(0.0),
+                spread: lens.get(3).copied().unwrap_or(0.0),
+                color: col.unwrap_or(Color::BLACK),
+                inset,
+            })
+        })
+        .collect()
+}
+
+/// A `transform` made only of pixel translations, as an x and y shift.
+fn translation(v: &str, font_size: f64) -> Option<[f64; 2]> {
+    if v.trim().eq_ignore_ascii_case("none") {
+        return Some([0.0; 2]);
+    }
+    let mut out = [0.0; 2];
+    for f in split_ws(v) {
+        let (name, args) = f.split_once('(')?;
+        let args: Vec<f64> = split_top(args.strip_suffix(')')?, ',')
+            .iter()
+            .map(|a| length(a, font_size))
+            .collect::<Option<_>>()?;
+        match (name.to_ascii_lowercase().as_str(), args.as_slice()) {
+            ("translate", [x]) | ("translatex", [x]) => out[0] += x,
+            ("translate", [x, y]) => {
+                out[0] += x;
+                out[1] += y;
+            }
+            ("translatey", [y]) => out[1] += y,
+            ("translate3d", [x, y, z]) if *z == 0.0 => {
+                out[0] += x;
+                out[1] += y;
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// A `grid-column` or `grid-row` value: `2`, `1 / 3`, `span 2`, `1 / span 2`.
+fn grid_line(v: &str) -> Option<[GridPos; 2]> {
+    let one = |s: &str| -> Option<GridPos> {
+        let s = s.trim().to_ascii_lowercase();
+        if s == "auto" {
+            Some(GridPos::Auto)
+        } else if let Some(n) = s.strip_prefix("span") {
+            n.trim().parse().ok().map(GridPos::Span)
+        } else {
+            s.parse().ok().map(GridPos::Line)
+        }
+    };
+    let (a, b) = v.split_once('/').unwrap_or((v, "auto"));
+    Some([one(a)?, one(b)?])
 }
 
 const NAMED: &[(&str, u32)] = &[
@@ -396,9 +548,16 @@ pub fn gradient(s: &str) -> Option<Paint> {
     let args = split_top(inner, ',');
     let mut stops_src: &[String] = &args;
     let mut angle = 180.0f64; // to bottom
+    let mut to_corner = None;
     if name == "linear-gradient" {
         let first = args.first()?.to_ascii_lowercase();
-        if let Some(d) = first.strip_suffix("deg") {
+        if let Some(d) = first.strip_suffix("turn") {
+            angle = d.trim().parse::<f64>().ok()? * 360.0;
+            stops_src = &args[1..];
+        } else if let Some(d) = first.strip_suffix("rad") {
+            angle = d.trim().parse::<f64>().ok()?.to_degrees();
+            stops_src = &args[1..];
+        } else if let Some(d) = first.strip_suffix("deg") {
             angle = d.trim().parse().ok()?;
             stops_src = &args[1..];
         } else if let Some(dir) = first.strip_prefix("to ") {
@@ -413,6 +572,7 @@ pub fn gradient(s: &str) -> Option<Paint> {
                 }
             }
             angle = x.atan2(-y).to_degrees();
+            to_corner = Some((x as i8, y as i8));
             stops_src = &args[1..];
         }
     } else if name == "radial-gradient" {
@@ -451,7 +611,10 @@ pub fn gradient(s: &str) -> Option<Paint> {
             stops,
             from: v2(0.5 - d.x, 0.5 - d.y),
             to: v2(0.5 + d.x, 0.5 + d.y),
-            css: None,
+            css: Some(match to_corner {
+                Some((x, y)) => CssAngle::To(x, y),
+                None => CssAngle::Deg(angle),
+            }),
         }
     } else {
         Paint::Radial {
@@ -470,7 +633,36 @@ fn gradient_css(p: &Paint) -> Option<String> {
             .join(", ")
     };
     match p {
-        Paint::Linear { stops: s, from, to, .. } => {
+        Paint::Linear {
+            stops: s,
+            css: Some(CssAngle::To(x, y)),
+            ..
+        } => {
+            let side = |v: i8, neg: &'static str, pos: &'static str| match v {
+                0 => "",
+                v if v < 0 => neg,
+                _ => pos,
+            };
+            let dir = [side(*y, "top", "bottom"), side(*x, "left", "right")]
+                .iter()
+                .filter(|w| !w.is_empty())
+                .copied()
+                .collect::<Vec<_>>()
+                .join(" ");
+            Some(format!("linear-gradient(to {dir}, {})", stops(s)))
+        }
+        Paint::Linear {
+            stops: s,
+            css: Some(CssAngle::Deg(a)),
+            ..
+        } => Some(format!(
+            "linear-gradient({}deg, {})",
+            a.rem_euclid(360.0).round(),
+            stops(s)
+        )),
+        Paint::Linear {
+            stops: s, from, to, ..
+        } => {
             let a = (to.x - from.x)
                 .atan2(-(to.y - from.y))
                 .to_degrees()
@@ -538,13 +730,16 @@ fn set_size(n: &mut Node, axis: usize, v: &str, ctx: &Context, a: &mut Applied, 
     let is_text = matches!(n.kind, NodeKind::Text { .. });
     match v {
         "fit-content" | "auto" | "max-content" | "min-content" => {
+            n.layout_child.percent[axis] = None;
             if is_text {
                 if axis == 0
                     && let NodeKind::Text { auto_width, .. } = &mut n.kind
                 {
                     *auto_width = true;
                 }
-                axis_set(n, axis, Sizing::Fixed);
+                // `max-content` never wraps; the others fit the space they're given.
+                let wraps = axis == 0 && v != "max-content";
+                axis_set(n, axis, if wraps { Sizing::Hug } else { Sizing::Fixed });
             } else {
                 axis_set(n, axis, Sizing::Hug);
             }
@@ -552,7 +747,17 @@ fn set_size(n: &mut Node, axis: usize, v: &str, ctx: &Context, a: &mut Applied, 
         _ => {
             if let Some(p) = percent(v) {
                 if ctx.parent_layout.is_some() && p >= 0.999 {
+                    n.layout_child.percent[axis] = None;
                     axis_set(n, axis, Sizing::Fill);
+                    if axis == 0
+                        && let NodeKind::Text { auto_width, .. } = &mut n.kind
+                    {
+                        *auto_width = false;
+                    }
+                } else if ctx.parent_layout.is_some() {
+                    // Layout resolves it against the parent's final size.
+                    n.layout_child.percent[axis] = Some(p);
+                    axis_set(n, axis, Sizing::Fixed);
                     if axis == 0
                         && let NodeKind::Text { auto_width, .. } = &mut n.kind
                     {
@@ -566,6 +771,7 @@ fn set_size(n: &mut Node, axis: usize, v: &str, ctx: &Context, a: &mut Applied, 
                     a.ignored.push(key.into());
                 }
             } else if let Some(px) = length(v, fs) {
+                n.layout_child.percent[axis] = None;
                 resize_axis(n, axis, px.max(0.0));
                 axis_set(n, axis, Sizing::Fixed);
             } else {
@@ -590,6 +796,82 @@ fn resize_axis(n: &mut Node, axis: usize, size: f64) {
     } else {
         n.set_rect_scaling(r);
     }
+}
+
+fn self_align(v: &str) -> Option<Option<SelfAlign>> {
+    Some(match v.trim() {
+        "auto" | "normal" => None,
+        "center" => Some(SelfAlign::Center),
+        "flex-start" | "start" | "self-start" => Some(SelfAlign::Start),
+        "flex-end" | "end" | "self-end" => Some(SelfAlign::End),
+        "stretch" => Some(SelfAlign::Stretch),
+        _ => return None,
+    })
+}
+
+fn set_border_space(n: &mut Node, side: Option<usize>, width: f64) {
+    if let Some(l) = &mut n.layout {
+        match side {
+            Some(i) => l.border[i] = width,
+            None => l.border = [width; 4],
+        }
+    }
+}
+
+/// The per-side borders, starting from the uniform border when there are none yet.
+fn sides_mut(n: &mut Node) -> &mut [BorderSide; 4] {
+    let (stroke, width) = (n.style.stroke, n.style.stroke_width);
+    n.style.borders.get_or_insert_with(|| {
+        [BorderSide {
+            width: if stroke.is_some() { width } else { 0.0 },
+            color: stroke,
+        }; 4]
+    })
+}
+
+/// One side's `border-top`-style shorthand. False for dashes, which only uniform borders have.
+fn apply_side(n: &mut Node, i: usize, v: &str, fs: f64) -> bool {
+    let lower = v.to_ascii_lowercase();
+    if lower == "none" || lower == "0" {
+        sides_mut(n)[i].width = 0.0;
+        set_border_space(n, Some(i), 0.0);
+        return true;
+    }
+    let (mut width, mut col, mut solid) = (1.0, Color::INK, true);
+    let mut any = false;
+    for p in split_ws(&lower) {
+        if let Some(w) = length(&p, fs) {
+            width = w;
+            any = true;
+        } else if let Some(c) = color(&p) {
+            col = c;
+            any = true;
+        } else if p == "solid" {
+            any = true;
+        } else if matches!(p.as_str(), "dashed" | "dotted" | "double") {
+            solid = false;
+            any = true;
+        } else {
+            return false;
+        }
+    }
+    if !any {
+        return false;
+    }
+    sides_mut(n)[i] = BorderSide {
+        width,
+        color: Some(col),
+    };
+    set_border_space(n, Some(i), width);
+    solid
+}
+
+const SIDES: [&str; 4] = ["Top", "Right", "Bottom", "Left"];
+
+/// The side a `border<Side><suffix>` property names, if it does.
+fn side_of(k: &str, prefix: &str, suffix: &str) -> Option<usize> {
+    let rest = k.strip_prefix(prefix)?.strip_suffix(suffix)?;
+    SIDES.iter().position(|s| *s == rest)
 }
 
 fn align_of(v: &str) -> Option<Align> {
@@ -627,6 +909,13 @@ pub fn apply(n: &mut Node, styles: &[(String, String)], ctx: &Context) -> Applie
     }
     let is_text = n.kind.text().is_some();
     let fs = n.kind.font_size().unwrap_or(16.0);
+    // Resolved after the loop, whatever order the properties came in.
+    let (mut translate, mut radius_pct) = (None, None);
+    let position = styles
+        .iter()
+        .rev()
+        .find(|(k, _)| k == "position")
+        .map(|(_, v)| v.trim().to_ascii_lowercase());
     for (k, v) in styles {
         let v = v.trim();
         let lower = v.to_ascii_lowercase();
@@ -640,27 +929,31 @@ pub fn apply(n: &mut Node, styles: &[(String, String)], ctx: &Context) -> Applie
                 set_size(n, 1, v, ctx, &mut a, k);
                 true
             }
-            "left" | "x" => match length(v, fs) {
-                Some(x) => {
-                    n.rect.x = x;
-                    true
+            "left" | "x" | "top" | "y" | "right" | "bottom" => {
+                let i = match k.as_str() {
+                    "top" | "y" => 0,
+                    "right" => 1,
+                    "bottom" => 2,
+                    _ => 3,
+                };
+                match dim(v, fs) {
+                    Some(d) => {
+                        if ctx.parent_layout.is_some() {
+                            n.layout_child.inset[i] = (d != Dim::Auto).then_some(d);
+                        }
+                        if let Dim::Px(px) = d {
+                            match i {
+                                0 => n.rect.y = px,
+                                1 => a.right = Some(px),
+                                2 => a.bottom = Some(px),
+                                _ => n.rect.x = px,
+                            }
+                        }
+                        // Without a layout parent, only pixel offsets can be honored.
+                        ctx.parent_layout.is_some() || matches!(d, Dim::Px(_))
+                    }
+                    None => false,
                 }
-                None => false,
-            },
-            "top" | "y" => match length(v, fs) {
-                Some(y) => {
-                    n.rect.y = y;
-                    true
-                }
-                None => false,
-            },
-            "right" => {
-                a.right = length(v, fs);
-                a.right.is_some()
-            }
-            "bottom" => {
-                a.bottom = length(v, fs);
-                a.bottom.is_some()
             }
             "position" => {
                 match lower.as_str() {
@@ -676,10 +969,20 @@ pub fn apply(n: &mut Node, styles: &[(String, String)], ctx: &Context) -> Applie
                 }
                 "flex" | "inline-flex" if n.is_frame() => {
                     n.visible = true;
-                    layout_mut(n);
+                    layout_mut(n).mode = LayoutMode::Flex;
                     true
                 }
-                "block" | "inline-block" | "flex" | "inline-flex" => {
+                "grid" | "inline-grid" if n.is_frame() => {
+                    n.visible = true;
+                    layout_mut(n).mode = LayoutMode::Grid;
+                    true
+                }
+                "block" | "inline-block" | "inline" | "flow-root" if n.is_frame() => {
+                    n.visible = true;
+                    layout_mut(n).mode = LayoutMode::Block;
+                    true
+                }
+                "block" | "inline-block" | "inline" | "flow-root" | "flex" | "inline-flex" => {
                     n.visible = true;
                     true
                 }
@@ -695,8 +998,35 @@ pub fn apply(n: &mut Node, styles: &[(String, String)], ctx: &Context) -> Applie
                 } else {
                     Direction::Horizontal
                 };
-                true
+                !lower.ends_with("-reverse")
             }
+            "gridTemplateColumns" | "gridTemplateRows" if n.is_frame() => {
+                if lower == "none" {
+                    n.grid = None;
+                    true
+                } else if crate::layout::parse_tracks(&lower).is_some() {
+                    let g = n.grid.get_or_insert_with(GridSpec::default);
+                    if k == "gridTemplateColumns" {
+                        g.columns = lower.clone();
+                    } else {
+                        g.rows = lower.clone();
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+            "gridColumn" | "gridRow" => match grid_line(v) {
+                Some(line) => {
+                    if k == "gridColumn" {
+                        n.layout_child.grid_column = line;
+                    } else {
+                        n.layout_child.grid_row = line;
+                    }
+                    true
+                }
+                None => false,
+            },
             "flexWrap" if n.is_frame() => {
                 layout_mut(n).wrap = lower.starts_with("wrap");
                 true
@@ -781,6 +1111,11 @@ pub fn apply(n: &mut Node, styles: &[(String, String)], ctx: &Context) -> Applie
                     "space-between" | "space-around" | "space-evenly"
                 ) {
                     l.gap_auto = true;
+                    l.distribute = match lower.as_str() {
+                        "space-around" => Distribute::Around,
+                        "space-evenly" => Distribute::Evenly,
+                        _ => Distribute::Between,
+                    };
                     true
                 } else if let Some(al) = align_of(&lower) {
                     l.gap_auto = false;
@@ -798,17 +1133,38 @@ pub fn apply(n: &mut Node, styles: &[(String, String)], ctx: &Context) -> Applie
                 None => false,
             },
             "flexGrow" | "flex" => {
-                let grow = split_ws(v)
-                    .first()
-                    .and_then(|g| g.parse::<f64>().ok())
-                    .unwrap_or(0.0);
-                match ctx.parent_layout {
-                    Some(pl) => {
+                // `flex` is `grow [shrink] [basis]`, or one of two keywords.
+                let parts = split_ws(&lower);
+                let (grow, shrink, basis) = if k == "flexGrow" {
+                    (lower.parse::<f64>().ok(), None, None)
+                } else {
+                    match lower.as_str() {
+                        "none" => (Some(0.0), Some(0.0), Some(Dim::Auto)),
+                        "auto" => (Some(1.0), Some(1.0), Some(Dim::Auto)),
+                        _ => {
+                            let g = parts.first().and_then(|g| g.parse::<f64>().ok());
+                            let s = parts.get(1).and_then(|s| s.parse::<f64>().ok());
+                            let b = parts.last().filter(|_| parts.len() > 1).and_then(|p| {
+                                p.parse::<f64>().is_err().then(|| dim(p, fs)).flatten()
+                            });
+                            (g, s.or(Some(1.0)), b.or(Some(Dim::Px(0.0))))
+                        }
+                    }
+                };
+                match (ctx.parent_layout, grow) {
+                    (Some(pl), Some(grow)) => {
                         let ma = if pl.direction == Direction::Horizontal {
                             0
                         } else {
                             1
                         };
+                        n.layout_child.grow = Some(grow);
+                        if shrink.is_some() {
+                            n.layout_child.shrink = shrink;
+                        }
+                        if basis.is_some() {
+                            n.layout_child.basis = basis;
+                        }
                         if grow > 0.0 {
                             axis_set(n, ma, Sizing::Fill);
                             if ma == 0
@@ -819,35 +1175,146 @@ pub fn apply(n: &mut Node, styles: &[(String, String)], ctx: &Context) -> Applie
                         }
                         true
                     }
-                    None => false,
+                    _ => false,
                 }
             }
-            "alignSelf" => match ctx.parent_layout {
-                Some(pl) if lower == "stretch" => {
+            "flexShrink" => match lower.parse::<f64>() {
+                Ok(s) => {
+                    n.layout_child.shrink = Some(s.max(0.0));
+                    true
+                }
+                Err(_) => false,
+            },
+            "flexBasis" => match dim(v, fs) {
+                Some(b) => {
+                    n.layout_child.basis = Some(b);
+                    true
+                }
+                None => false,
+            },
+            "alignSelf" => match (ctx.parent_layout, self_align(&lower)) {
+                (Some(pl), Some(al)) => {
                     let ca = if pl.direction == Direction::Horizontal {
                         1
                     } else {
                         0
                     };
-                    axis_set(n, ca, Sizing::Fill);
-                    if ca == 0
-                        && let NodeKind::Text { auto_width, .. } = &mut n.kind
-                    {
-                        *auto_width = false;
+                    n.layout_child.align_self = al.filter(|a| *a != SelfAlign::Stretch);
+                    if al == Some(SelfAlign::Stretch) {
+                        axis_set(n, ca, Sizing::Fill);
+                        if ca == 0
+                            && let NodeKind::Text { auto_width, .. } = &mut n.kind
+                        {
+                            *auto_width = false;
+                        }
                     }
                     true
                 }
                 _ => false,
             },
-            "flexShrink" | "flexBasis" | "boxSizing" | "minWidth" | "minHeight" | "maxWidth"
-            | "maxHeight" | "zIndex" | "cursor" | "whiteSpace" | "fontFamily" | "wordBreak"
-            | "overflowWrap" => {
-                // Accepted without an equivalent; harmless. fontFamily: Inter is the only face.
-                !matches!(
-                    k.as_str(),
-                    "minWidth" | "minHeight" | "maxWidth" | "maxHeight"
+            "minWidth" | "minHeight" | "maxWidth" | "maxHeight" => {
+                let axis = usize::from(k.ends_with("Height"));
+                let slot = if k.starts_with("min") {
+                    &mut n.layout_child.min
+                } else {
+                    &mut n.layout_child.max
+                };
+                if lower == "none" {
+                    slot[axis] = None;
+                    true
+                } else {
+                    match dim(v, fs) {
+                        Some(d) => {
+                            slot[axis] = (d != Dim::Auto).then_some(d);
+                            true
+                        }
+                        None => false,
+                    }
+                }
+            }
+            "margin" => match four_dims(v, fs) {
+                Some(m) => {
+                    n.layout_child.margin = m.map(Some);
+                    true
+                }
+                None => false,
+            },
+            "marginInline" | "marginBlock" => {
+                let parts: Vec<Dim> = split_ws(v).iter().filter_map(|p| dim(p, fs)).collect();
+                match parts.as_slice() {
+                    [a0, rest @ ..] => {
+                        let b0 = rest.first().copied().unwrap_or(*a0);
+                        let m = &mut n.layout_child.margin;
+                        if k == "marginInline" {
+                            (m[3], m[1]) = (Some(*a0), Some(b0));
+                        } else {
+                            (m[0], m[2]) = (Some(*a0), Some(b0));
+                        }
+                        true
+                    }
+                    _ => false,
+                }
+            }
+            k_ if side_of(k_, "margin", "").is_some() => match dim(v, fs) {
+                Some(d) => {
+                    n.layout_child.margin[side_of(k_, "margin", "").unwrap()] = Some(d);
+                    true
+                }
+                None => false,
+            },
+            "aspectRatio" => {
+                let parts: Vec<f64> = lower
+                    .split('/')
+                    .filter_map(|p| p.trim().parse().ok())
+                    .collect();
+                match parts.as_slice() {
+                    [w] if *w > 0.0 => {
+                        n.layout_child.aspect = Some(*w);
+                        true
+                    }
+                    [w, h] if *w > 0.0 && *h > 0.0 => {
+                        n.layout_child.aspect = Some(w / h);
+                        true
+                    }
+                    _ => false,
+                }
+            }
+            "transform" => {
+                translate = translation(v, fs);
+                translate.is_some() && ctx.parent_layout.is_some()
+            }
+            "boxShadow" if !is_text => match shadows(v, fs) {
+                Some(s) => {
+                    n.style.shadows = s;
+                    true
+                }
+                None => false,
+            },
+            // Every frame measures itself this way; `content-box` would need a different model.
+            "boxSizing" => lower == "border-box",
+            "whiteSpace" => {
+                if is_text && matches!(lower.as_str(), "nowrap" | "pre") {
+                    if let NodeKind::Text { auto_width, .. } = &mut n.kind {
+                        *auto_width = true;
+                    }
+                    axis_set(n, 0, Sizing::Fixed);
+                }
+                true
+            }
+            "fontFamily" => !is_text || is_inter(v),
+            "textTransform" => {
+                if is_text && let Some(t) = n.kind.text_mut() {
+                    let mut chars: Vec<char> = t.chars().collect();
+                    transform_text(&mut chars, &lower);
+                    *t = chars.into_iter().collect();
+                }
+                matches!(
+                    lower.as_str(),
+                    "none" | "uppercase" | "lowercase" | "capitalize"
                 )
             }
+            // Text already breaks inside a word that doesn't fit, and the cursor is for browsers.
+            "cursor" | "wordBreak" | "overflowWrap" => true,
             "overflow" if n.is_frame() => {
                 if let NodeKind::Frame { clip } = &mut n.kind {
                     *clip = matches!(lower.as_str(), "hidden" | "clip" | "scroll" | "auto");
@@ -879,7 +1346,11 @@ pub fn apply(n: &mut Node, styles: &[(String, String)], ctx: &Context) -> Applie
                 }
                 true
             }
-            "backgroundPosition" | "backgroundRepeat" | "objectPosition" => true,
+            // Images always crop around their center.
+            "backgroundPosition" | "objectPosition" => {
+                matches!(lower.as_str(), "center" | "center center" | "50% 50%")
+            }
+            "backgroundRepeat" => true,
             "color" if is_text => match color(v) {
                 Some(c) => {
                     if matches!(n.kind, NodeKind::Sticky { .. }) {
@@ -893,15 +1364,14 @@ pub fn apply(n: &mut Node, styles: &[(String, String)], ctx: &Context) -> Applie
                 None => false,
             },
             "color" => true, // inherited by text children; meaningless on boxes
-            "fontWeight" if is_text => {
-                let w = match lower.as_str() {
-                    "bold" | "bolder" => 700.0,
-                    "normal" | "lighter" => 400.0,
-                    _ => v.parse().unwrap_or(400.0),
-                };
-                n.text_style.bold = w >= 600.0;
-                true
-            }
+            "fontWeight" if is_text => match font_weight(v) {
+                Some(w) => {
+                    n.text_style.weight = Some(w);
+                    n.text_style.bold = w >= 600;
+                    true
+                }
+                None => false,
+            },
             "fontStyle" if is_text => {
                 n.text_style.italic = lower == "italic" || lower == "oblique";
                 true
@@ -950,9 +1420,50 @@ pub fn apply(n: &mut Node, styles: &[(String, String)], ctx: &Context) -> Applie
             }
             "fontWeight" | "fontStyle" | "lineHeight" | "letterSpacing" | "textAlign"
             | "textDecoration" => true, // inherited by text children
-            "border" | "outline" | "borderTop" | "borderRight" | "borderBottom" | "borderLeft" => {
-                apply_border(n, v, fs)
+            "border" => {
+                let ok = apply_border(n, v, fs);
+                let width = if n.style.stroke.is_some() {
+                    n.style.stroke_width
+                } else {
+                    0.0
+                };
+                n.style.borders = None;
+                set_border_space(n, None, width);
+                ok
             }
+            "outline" => apply_border(n, v, fs),
+            k_ if side_of(k_, "border", "").is_some() => {
+                apply_side(n, side_of(k_, "border", "").unwrap(), v, fs)
+            }
+            k_ if side_of(k_, "border", "Width").is_some() => match length(v, fs) {
+                Some(w) => {
+                    let i = side_of(k_, "border", "Width").unwrap();
+                    sides_mut(n)[i].width = w;
+                    set_border_space(n, Some(i), w);
+                    true
+                }
+                None => false,
+            },
+            k_ if side_of(k_, "border", "Color").is_some() => match color(v) {
+                Some(c) => {
+                    sides_mut(n)[side_of(k_, "border", "Color").unwrap()].color = Some(c);
+                    true
+                }
+                None => false,
+            },
+            "borderWidth" if split_ws(v).len() > 1 => match four(v, fs) {
+                Some(w) => {
+                    let sides = sides_mut(n);
+                    for i in 0..4 {
+                        sides[i].width = w[i];
+                    }
+                    for (i, width) in w.iter().enumerate() {
+                        set_border_space(n, Some(i), *width);
+                    }
+                    true
+                }
+                None => false,
+            },
             "borderColor" | "stroke" => match color(v) {
                 Some(c) => {
                     n.style.stroke = (c.a > 0).then_some(c);
@@ -968,6 +1479,8 @@ pub fn apply(n: &mut Node, styles: &[(String, String)], ctx: &Context) -> Applie
                     n.style.stroke_width = w;
                     if k == "borderWidth" {
                         n.style.stroke_align = crate::model::StrokeAlign::Inside;
+                        n.style.borders = None;
+                        set_border_space(n, None, w);
                     }
                     if w > 0.0 && n.style.stroke.is_none() {
                         n.style.stroke = Some(Color::INK);
@@ -999,7 +1512,7 @@ pub fn apply(n: &mut Node, styles: &[(String, String)], ctx: &Context) -> Applie
                 }
                 None => match percent(v) {
                     Some(p) => {
-                        n.style.corner_radius = n.rect.w.min(n.rect.h) * p;
+                        radius_pct = Some(p);
                         true
                     }
                     None => false,
@@ -1099,6 +1612,40 @@ pub fn apply(n: &mut Node, styles: &[(String, String)], ctx: &Context) -> Applie
         };
         if !ok && !a.ignored.contains(k) {
             a.ignored.push(k.clone());
+        }
+    }
+    if let Some(p) = radius_pct {
+        // 50% makes a circle or pill whatever the final size turns out to be.
+        n.style.corner_radius = if p >= 0.5 {
+            9999.0
+        } else {
+            n.rect.w.min(n.rect.h) * p
+        };
+        n.style.radii = None;
+    }
+    if ctx.parent_layout.is_some() {
+        let lc = &mut n.layout_child;
+        if !lc.absolute {
+            // Offsets only move positioned boxes: `relative` shifts one, and otherwise they do
+            // nothing, as in CSS. Either way they aren't absolute offsets.
+            let offset = |d: Option<Dim>| match d {
+                Some(Dim::Px(v)) => v,
+                _ => 0.0,
+            };
+            let inset = std::mem::take(&mut lc.inset);
+            if position.as_deref() == Some("relative") {
+                let x = offset(inset[3]) - offset(inset[1]);
+                let y = offset(inset[0]) - offset(inset[2]);
+                lc.shift = [x, y];
+            }
+        }
+        if let Some(t) = translate {
+            let base = if position.as_deref() == Some("relative") {
+                lc.shift
+            } else {
+                [0.0; 2]
+            };
+            lc.shift = [base[0] + t[0], base[1] + t[1]];
         }
     }
     a
@@ -1212,11 +1759,63 @@ pub fn computed(n: &Node, parent_layout: Option<&AutoLayout>, is_root: bool) -> 
         put("left", px(n.rect.x));
         put("top", px(n.rect.y));
     }
-    let size_css = |axis: usize, v: f64| match n.layout_child.sizing[axis] {
-        Sizing::Hug => "fit-content".to_string(),
-        Sizing::Fill if parent_layout.is_some() => "100%".to_string(),
+    let lc = &n.layout_child;
+    let dim_css = |d: Dim| match d {
+        Dim::Px(v) => px(v),
+        Dim::Pct(p) => format!("{}%", (p * 10000.0).round() / 100.0),
+        Dim::Auto => "auto".to_string(),
+    };
+    let size_css = |axis: usize, v: f64| match (lc.percent[axis], lc.sizing[axis]) {
+        (Some(p), _) => dim_css(Dim::Pct(p)),
+        (None, Sizing::Hug) => "fit-content".to_string(),
+        (None, Sizing::Fill) if parent_layout.is_some() => "100%".to_string(),
         _ => px(v),
     };
+    if lc.absolute {
+        for (i, side) in ["top", "right", "bottom", "left"].iter().enumerate() {
+            if let Some(d) = lc.inset[i] {
+                put(side, dim_css(d));
+            }
+        }
+    }
+    if lc.shift != [0.0; 2] {
+        put(
+            "transform",
+            format!("translate({}, {})", px(lc.shift[0]), px(lc.shift[1])),
+        );
+    }
+    for (axis, (min, max)) in [
+        ("Width", (lc.min[0], lc.max[0])),
+        ("Height", (lc.min[1], lc.max[1])),
+    ] {
+        if let Some(d) = min {
+            put(&format!("min{axis}"), dim_css(d));
+        }
+        if let Some(d) = max {
+            put(&format!("max{axis}"), dim_css(d));
+        }
+    }
+    if lc.margin.iter().any(Option::is_some) {
+        let m = lc.margin.map(|d| dim_css(d.unwrap_or(Dim::Px(0.0))));
+        put("margin", m.join(" "));
+    }
+    if let Some(a) = lc.aspect {
+        put("aspectRatio", format!("{}", (a * 1000.0).round() / 1000.0));
+    }
+    let grid_css = |g: [GridPos; 2]| {
+        let one = |p: GridPos| match p {
+            GridPos::Auto => "auto".to_string(),
+            GridPos::Line(i) => i.to_string(),
+            GridPos::Span(n) => format!("span {n}"),
+        };
+        format!("{} / {}", one(g[0]), one(g[1]))
+    };
+    if lc.grid_column != [GridPos::Auto; 2] {
+        put("gridColumn", grid_css(lc.grid_column));
+    }
+    if lc.grid_row != [GridPos::Auto; 2] {
+        put("gridRow", grid_css(lc.grid_row));
+    }
     if let NodeKind::Text { auto_width, .. } = &n.kind {
         if *auto_width {
             put("width", "fit-content".into());
@@ -1236,35 +1835,79 @@ pub fn computed(n: &Node, parent_layout: Option<&AutoLayout>, is_root: bool) -> 
         } else {
             1
         };
-        if n.layout_child.sizing[ma] == Sizing::Fill {
-            put("flexGrow", "1".into());
+        if n.layout_child.sizing[ma] == Sizing::Fill || lc.grow.is_some() {
+            put("flexGrow", format!("{}", lc.grow.unwrap_or(1.0)));
         }
         if n.layout_child.sizing[1 - ma] == Sizing::Fill {
             put("alignSelf", "stretch".into());
         }
-        put("flexShrink", "0".into());
+        if let Some(a) = lc.align_self {
+            put(
+                "alignSelf",
+                match a {
+                    SelfAlign::Start => "flex-start",
+                    SelfAlign::Center => "center",
+                    SelfAlign::End => "flex-end",
+                    SelfAlign::Stretch => "stretch",
+                }
+                .into(),
+            );
+        }
+        put("flexShrink", format!("{}", lc.shrink.unwrap_or(0.0)));
+        if let Some(b) = lc.basis {
+            put("flexBasis", dim_css(b));
+        }
     }
     if let Some(l) = &n.layout {
-        put("display", "flex".into());
         put(
-            "flexDirection",
-            if l.direction == Direction::Vertical {
-                "column"
-            } else {
-                "row"
+            "display",
+            match l.mode {
+                LayoutMode::Flex => "flex",
+                LayoutMode::Block => "block",
+                LayoutMode::Grid => "grid",
             }
             .into(),
         );
-        if l.wrap {
-            put("flexWrap", "wrap".into());
+        if l.mode == LayoutMode::Flex {
+            put(
+                "flexDirection",
+                if l.direction == Direction::Vertical {
+                    "column"
+                } else {
+                    "row"
+                }
+                .into(),
+            );
+            if l.wrap {
+                put("flexWrap", "wrap".into());
+            }
+            if l.gap_auto {
+                put(
+                    "justifyContent",
+                    match l.distribute {
+                        Distribute::Between => "space-between",
+                        Distribute::Around => "space-around",
+                        Distribute::Evenly => "space-evenly",
+                    }
+                    .into(),
+                );
+            } else {
+                put("justifyContent", align_css(l.align_main).into());
+                put("gap", px(l.gap));
+            }
+            put("alignItems", align_css(l.align_cross).into());
         }
-        if l.gap_auto {
-            put("justifyContent", "space-between".into());
-        } else {
-            put("justifyContent", align_css(l.align_main).into());
+        if l.mode == LayoutMode::Grid {
+            if let Some(g) = &n.grid {
+                if !g.columns.is_empty() {
+                    put("gridTemplateColumns", g.columns.clone());
+                }
+                if !g.rows.is_empty() {
+                    put("gridTemplateRows", g.rows.clone());
+                }
+            }
             put("gap", px(l.gap));
         }
-        put("alignItems", align_css(l.align_cross).into());
         let p = l.padding;
         if p.iter().any(|x| *x != 0.0) {
             put(
@@ -1289,10 +1932,11 @@ pub fn computed(n: &Node, parent_layout: Option<&AutoLayout>, is_root: bool) -> 
         } => {
             put("fontFamily", "Inter".into());
             put("fontSize", px(*font_size));
-            put(
-                "fontWeight",
-                if n.text_style.bold { "700" } else { "400" }.into(),
-            );
+            let weight = n
+                .text_style
+                .weight
+                .unwrap_or(if n.text_style.bold { 700 } else { 400 });
+            put("fontWeight", weight.to_string());
             if n.text_style.italic {
                 put("fontStyle", "italic".into());
             }
@@ -1340,7 +1984,16 @@ pub fn computed(n: &Node, parent_layout: Option<&AutoLayout>, is_root: bool) -> 
             }
         }
     }
-    if let Some(s) = n.style.stroke
+    if let Some(sides) = &n.style.borders {
+        for (name, side) in SIDES.iter().zip(sides) {
+            if let (true, Some(c)) = (side.width > 0.0, side.color.or(n.style.stroke)) {
+                put(
+                    &format!("border{name}"),
+                    format!("{} solid {}", px(side.width), color_css(c)),
+                );
+            }
+        }
+    } else if let Some(s) = n.style.stroke
         && n.style.stroke_width > 0.0
     {
         let kind = if n.style.dash.is_empty() {
@@ -1362,6 +2015,25 @@ pub fn computed(n: &Node, parent_layout: Option<&AutoLayout>, is_root: bool) -> 
         );
     } else if n.style.corner_radius > 0.0 {
         put("borderRadius", px(n.style.corner_radius));
+    }
+    if !n.style.shadows.is_empty() {
+        let layers: Vec<String> = n
+            .style
+            .shadows
+            .iter()
+            .map(|s| {
+                format!(
+                    "{}{} {} {} {} {}",
+                    if s.inset { "inset " } else { "" },
+                    px(s.x),
+                    px(s.y),
+                    px(s.blur),
+                    px(s.spread),
+                    color_css(s.color)
+                )
+            })
+            .collect();
+        put("boxShadow", layers.join(", "));
     }
     if n.style.opacity < 1.0 {
         put(
@@ -1453,7 +2125,8 @@ mod tests {
         assert_eq!(n.style.stroke_width, 2.0);
         assert!(!n.style.dash.is_empty());
         assert_eq!(n.style.corner_radius, 12.0);
-        assert_eq!(a.ignored, vec!["boxShadow".to_string()]);
+        assert!(a.ignored.is_empty(), "{:?}", a.ignored);
+        assert_eq!(n.style.shadows.len(), 1);
         let back = computed(&n, None, true);
         assert_eq!(back["flexDirection"], "column");
         assert_eq!(back["borderRadius"], "12px");
@@ -1461,7 +2134,9 @@ mod tests {
 
     #[test]
     fn gradients_and_sketch() {
-        let Some(Paint::Linear { stops, from, to, .. }) = gradient("linear-gradient(90deg, red, blue)")
+        let Some(Paint::Linear {
+            stops, from, to, ..
+        }) = gradient("linear-gradient(90deg, red, blue)")
         else {
             panic!()
         };

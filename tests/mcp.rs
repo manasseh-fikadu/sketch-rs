@@ -89,13 +89,13 @@ fn artboard_and_html_become_auto_layout_frames_and_text() {
     assert_eq!((text.as_str(), *font_size), ("Welcome back", 32.0));
     assert!(title.text_style.bold);
     assert_eq!(title.style.fill(), Some(Color::rgb(0x11, 0x11, 0x11)));
-    // Text fills the card's inner width and sits inside its padding.
+    // Text fills the card's inner width and sits inside its 1px border and 16px padding.
     assert!(
-        (title.rect.w - (342.0 - 32.0)).abs() < 0.5,
+        (title.rect.w - (342.0 - 2.0 - 32.0)).abs() < 0.5,
         "{:?}",
         title.rect
     );
-    assert_eq!((title.rect.x, title.rect.y), (16.0, 16.0));
+    assert_eq!((title.rect.x, title.rect.y), (17.0, 17.0));
 
     let body = doc.get(c.children[1]).unwrap();
     let NodeKind::Text { text, .. } = &body.kind else {
@@ -129,7 +129,7 @@ fn artboard_and_html_become_auto_layout_frames_and_text() {
     );
 
     // The card hugs its content: padding + three children + two gaps.
-    let want = 16.0 + title.rect.h + 8.0 + body.rect.h + 8.0 + 44.0 + 16.0;
+    let want = 1.0 + 16.0 + title.rect.h + 8.0 + body.rect.h + 8.0 + 44.0 + 16.0 + 1.0;
     assert!((c.rect.h - want).abs() < 0.5, "{} vs {want}", c.rect.h);
 
     // One undo step removes the whole write.
@@ -228,13 +228,10 @@ fn editing_tools_update_move_duplicate_and_delete() {
     let up = call(
         &mut h,
         "update_styles",
-        json!({"updates": [{"nodeIds": [a.clone()], "styles": {"backgroundColor": "linear-gradient(90deg, red, blue)", "boxShadow": "0 1px 2px black", "sketch": true, "roughness": 2}}]}),
+        json!({"updates": [{"nodeIds": [a.clone()], "styles": {"backgroundColor": "linear-gradient(90deg, red, blue)", "filter": "0 1px 2px black", "sketch": true, "roughness": 2}}]}),
     );
     assert_eq!(up["updated"], 1);
-    assert_eq!(
-        up["ignoredStyles"][a.as_str().unwrap()],
-        json!(["boxShadow"])
-    );
+    assert_eq!(up["ignoredStyles"][a.as_str().unwrap()], json!(["filter"]));
     let an = h.ed.doc.get(num(&a)).unwrap();
     assert!(matches!(an.style.fills[0], Paint::Linear { .. }));
     assert_eq!(an.style.rough.unwrap().roughness, 2.0);
@@ -685,4 +682,234 @@ fn agent_design_screenshot() {
         "artboard hugs its content: {:?}",
         ab_node.rect
     );
+}
+
+/// `write_html` into a fresh 800px artboard; returns the host and the created root's id.
+fn written(html: &str) -> (exec::SessionHost, Value, Value) {
+    let mut h = host();
+    let ab = call(
+        &mut h,
+        "create_artboard",
+        json!({"name": "A", "styles": {"width": "800px", "height": "fit-content"}}),
+    );
+    let r = call(
+        &mut h,
+        "write_html",
+        json!({"targetNodeId": ab["id"], "mode": "insert-children", "html": html}),
+    );
+    let root = r["createdNodeIds"][0].clone();
+    h.ed.doc.validate().unwrap();
+    (h, root, r)
+}
+
+fn child(h: &exec::SessionHost, parent: &Value, i: usize) -> sketch_rs::model::Node {
+    let p = h.ed.doc.get(num(parent)).unwrap();
+    h.ed.doc.get(p.children[i]).unwrap().clone()
+}
+
+#[test]
+fn margin_and_grid_lay_out_like_css() {
+    let (h, root, r) = written(
+        r#"<div style="display:grid; grid-template-columns:repeat(3, 1fr); gap:20px; padding:10px">
+             <div style="height:50px; background:red"></div>
+             <div style="height:50px; background:green; margin-top:5px"></div>
+             <div style="height:50px; background:blue"></div>
+             <div style="height:30px; background:black; grid-column:span 2"></div>
+           </div>"#,
+    );
+    assert!(r.get("ignoredStyles").is_none(), "{r}");
+    let w = (800.0 - 20.0 - 40.0) / 3.0;
+    let c0 = child(&h, &root, 0).rect;
+    let c1 = child(&h, &root, 1).rect;
+    assert!((c0.w - w).abs() <= 1.0, "{c0:?}");
+    assert!((c1.x - (10.0 + w + 20.0)).abs() <= 1.0, "{c1:?}");
+    assert_eq!(c1.y, 15.0, "margin-top pushes it down");
+    let c3 = child(&h, &root, 3).rect;
+    assert!(
+        (c3.w - (2.0 * w + 20.0)).abs() <= 1.0,
+        "spans two columns: {c3:?}"
+    );
+    assert!(c3.y >= c0.y + c0.h + 20.0, "second row: {c3:?}");
+}
+
+#[test]
+fn block_margins_collapse_and_auto_centers() {
+    let (h, root, _) = written(
+        r#"<div style="display:block">
+             <div style="height:10px; background:red; margin-bottom:30px"></div>
+             <div style="height:10px; background:blue; margin-top:20px; width:100px; margin-left:auto; margin-right:auto"></div>
+           </div>"#,
+    );
+    let b = child(&h, &root, 1).rect;
+    assert_eq!(b.y, 40.0, "30px and 20px collapse to 30px");
+    assert_eq!(b.x, 350.0, "auto margins center it");
+}
+
+#[test]
+fn percent_stretch_and_positioning_resolve_at_layout_time() {
+    let (h, root, _) = written(
+        r#"<div style="display:flex; gap:10px">
+             <div style="position:relative; flex:1; padding:10px; background:red">
+               <div style="height:40px; background:white"></div>
+               <div style="position:absolute; top:4px; right:6px; width:20px; height:10px; background:blue"></div>
+             </div>
+             <div style="width:25%; background:green"><div style="width:50%; height:8px; background:black"></div></div>
+           </div>"#,
+    );
+    let (a, b) = (child(&h, &root, 0), child(&h, &root, 1));
+    assert_eq!(b.rect.w, 200.0, "25% of the row");
+    assert_eq!(a.rect.w, 590.0, "flex:1 takes the rest");
+    assert_eq!(b.rect.h, a.rect.h, "the default align-items stretches both");
+    let bar = h.ed.doc.get(b.children[0]).unwrap().rect;
+    assert_eq!(bar.w, 100.0, "percent of the parent's final width");
+    let badge = h.ed.doc.get(a.children[1]).unwrap().rect;
+    assert_eq!((badge.x, badge.y), (590.0 - 6.0 - 20.0, 4.0));
+}
+
+#[test]
+fn translate_moves_a_box_but_not_its_siblings() {
+    let (h, root, r) = written(
+        r#"<div style="display:flex">
+             <div style="width:10px; height:10px; background:red; transform:translateY(-8px)"></div>
+             <div style="width:10px; height:10px; background:blue"></div>
+           </div>"#,
+    );
+    assert!(r.get("ignoredStyles").is_none(), "{r}");
+    assert_eq!(child(&h, &root, 0).rect.y, -8.0);
+    assert_eq!(child(&h, &root, 1).rect.y, 0.0);
+    let (_, _, r) = written(r#"<div style="transform:rotate(10deg); height:5px"></div>"#);
+    assert_eq!(r["ignoredStyles"], json!(["transform"]));
+}
+
+#[test]
+fn inline_boxes_follow_text_align() {
+    let (h, root, _) = written(
+        r#"<div style="text-align:center">
+             <div style="display:inline-block; padding:4px; background:red; width:50px; height:20px"></div>
+             <p style="margin:0">Title</p>
+           </div>"#,
+    );
+    let pill = child(&h, &root, 0).rect;
+    assert_eq!(pill.x, 375.0, "centered, not stretched: {pill:?}");
+    assert_eq!(pill.w, 50.0);
+}
+
+#[test]
+fn weights_shadows_and_borders_are_kept_and_read_back() {
+    let (mut h, root, r) = written(
+        r#"<div style="border-top:2px solid #ff0000; box-shadow:0 2px 4px rgba(0,0,0,0.5), inset 0 0 1px #000; padding:8px">
+             <p style="font-weight:500; text-transform:uppercase">Medium <span style="font-weight:600; opacity:0.5; color:#112233">semi</span></p>
+           </div>"#,
+    );
+    assert!(r.get("ignoredStyles").is_none(), "{r}");
+    let frame = h.ed.doc.get(num(&root)).unwrap().clone();
+    assert_eq!(frame.style.shadows.len(), 2);
+    assert!(frame.style.shadows[1].inset);
+    let sides = frame.style.borders.unwrap();
+    assert_eq!((sides[0].width, sides[1].width), (2.0, 0.0));
+    let label = child(&h, &root, 0);
+    assert_eq!(label.kind.text().unwrap(), "MEDIUM SEMI");
+    assert_eq!(label.rect.y, 10.0, "padding plus the 2px border above it");
+    let style = |i| label.text_style.char_style(i, 16.0, Color::BLACK);
+    assert_eq!(style(0).weight, 500);
+    assert_eq!(style(8).weight, 600);
+    assert_eq!(style(8).color, Color::rgba(0x11, 0x22, 0x33, 128));
+
+    let st = call(
+        &mut h,
+        "get_computed_styles",
+        json!({"nodeIds": [root.clone()]}),
+    );
+    let st = &st[root.as_str().unwrap()];
+    assert_eq!(st["borderTop"], json!("2px solid #ff0000"));
+    assert!(st["boxShadow"].as_str().unwrap().contains("inset"), "{st}");
+    let jsx = match exec::call(&mut h, "get_jsx", &json!({"nodeId": root}))
+        .unwrap()
+        .remove(0)
+    {
+        Out::Text(t) => t,
+        Out::Image { .. } => panic!(),
+    };
+    assert!(jsx.contains("fontWeight: \"500\""), "{jsx}");
+}
+
+#[test]
+fn css_that_can_not_be_honored_is_reported_not_dropped() {
+    for (html, want) in [
+        (r#"<p style="font-family:Georgia">x</p>"#, "fontFamily"),
+        (
+            r#"<div style="filter:blur(2px); height:5px"></div>"#,
+            "filter",
+        ),
+        (r#"<div style="z-index:2; height:5px"></div>"#, "zIndex"),
+        (
+            r#"<div style="box-sizing:content-box; height:5px"></div>"#,
+            "boxSizing",
+        ),
+        (
+            r#"<div style="display:flex; flex-direction:row-reverse; height:5px"></div>"#,
+            "flexDirection",
+        ),
+        (
+            r#"<div style="border-top:1px dashed red; height:5px"></div>"#,
+            "borderTop",
+        ),
+        (r#"<p>a <span style="padding:4px">b</span></p>"#, "padding"),
+        (
+            r#"<p>a <span style="background:red">b</span></p>"#,
+            "background",
+        ),
+    ] {
+        let (_, _, r) = written(html);
+        let ignored = r["ignoredStyles"].as_array();
+        assert!(
+            ignored.is_some_and(|v| v.contains(&json!(want))),
+            "{html} should report {want}: {r}"
+        );
+    }
+    for html in [
+        r#"<p style="font-family:Inter, sans-serif">x</p>"#,
+        r#"<div style="box-sizing:border-box; height:5px"></div>"#,
+    ] {
+        let (_, _, r) = written(html);
+        assert!(r.get("ignoredStyles").is_none(), "{html}: {r}");
+    }
+}
+
+#[test]
+fn a_shadow_and_a_rounded_clip_reach_the_pixels() {
+    let (mut h, root, _) = written(
+        r#"<div style="width:200px; height:200px; padding:50px; background:#ffffff">
+             <div style="width:100px; height:100px; border-radius:50%; overflow:hidden; box-shadow:0 0 20px #ff0000; background:#00ff00">
+               <div style="width:100px; height:100px; background:#0000ff"></div>
+             </div>
+           </div>"#,
+    );
+    let outs = exec::call(
+        &mut h,
+        "get_screenshot",
+        &json!({"nodeId": root, "scale": 1}),
+    )
+    .unwrap();
+    let Out::Image { data, .. } = &outs[0] else {
+        panic!("no image");
+    };
+    let img = image::load_from_memory(data).unwrap().to_rgba8();
+    let px = |x, y| img.get_pixel(x, y).0;
+    assert_eq!(
+        px(100, 100)[..3],
+        [0, 0, 255],
+        "the child shows inside the circle"
+    );
+    let corner = px(55, 55);
+    assert!(
+        corner[0] > 200,
+        "the circle clips the blue child's corner: {corner:?}"
+    );
+    let glow = px(100, 45);
+    assert!(
+        glow[0] > 200 && glow[1] < 240,
+        "red glow just outside the top edge: {glow:?}"
+    );
+    assert_eq!(px(5, 5)[..3], [255, 255, 255], "and none far away");
 }

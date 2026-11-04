@@ -13,8 +13,8 @@ use crate::editor::Editor;
 use crate::geom::{Rect, V2, v2};
 use crate::history::Tx;
 use crate::model::{
-    AutoLayout, Binding, Color, Direction, Document, Head, ImageMode, Node, NodeId, NodeKind,
-    Paint, PathPoint, Route, Sizing, SubPath, TextAlign,
+    AutoLayout, Binding, Color, Direction, Document, Head, ImageMode, LayoutMode, Node, NodeId,
+    NodeKind, Paint, PathPoint, Route, Sizing, SubPath, TextAlign,
 };
 use crate::project::{Project, Store};
 use crate::render::gpu::Headless;
@@ -845,15 +845,14 @@ fn font_info(a: &Args) -> ToolResult {
                 "family": f,
                 "available": inter,
                 "styles": if inter { json!([
-                    {"weight": 400, "style": "normal"}, {"weight": 700, "style": "normal"},
+                    {"weight": 400, "style": "normal"}, {"weight": 500, "style": "normal"},
+                    {"weight": 600, "style": "normal"}, {"weight": 700, "style": "normal"},
                     {"weight": 400, "style": "italic"}, {"weight": 700, "style": "italic"}]) } else { json!([]) },
                 "note": if inter { "" } else { "not available; text renders in Inter" },
             })
         })
         .collect();
-    text(
-        json!({"families": fams, "weights": "fontWeight ≥ 600 renders bold, below renders regular"}),
-    )
+    text(json!({"families": fams, "weights": "fontWeight picks the closest available weight"}))
 }
 
 fn guide(a: &Args) -> ToolResult {
@@ -1222,8 +1221,6 @@ struct Parent {
     id: Option<NodeId>,
     layout: Option<AutoLayout>,
     size: Option<(f64, f64)>,
-    /// Size along x / y is known (not hugging its content).
-    definite: [bool; 2],
     /// Children without an explicit cross size stretch (CSS `align-items: normal`).
     stretch: bool,
 }
@@ -1235,17 +1232,12 @@ impl Parent {
                 id: None,
                 layout: None,
                 size: None,
-                definite: [false; 2],
                 stretch: false,
             },
             Some(n) => Parent {
                 id: Some(n.id),
                 layout: n.layout,
                 size: Some((n.rect.w, n.rect.h)),
-                definite: [
-                    n.layout_child.sizing[0] != Sizing::Hug,
-                    n.layout_child.sizing[1] != Sizing::Hug,
-                ],
                 stretch: stretches(page_id, n),
             },
         }
@@ -1348,6 +1340,7 @@ fn ua_styles(tag: &str) -> Styles {
 }
 
 const INHERITED: &[&str] = &[
+    "textTransform",
     "color",
     "fontSize",
     "fontWeight",
@@ -1389,23 +1382,41 @@ fn inherit(parent: &Styles, own: &Styles) -> Styles {
 /// Inline content as a styled character stream.
 #[derive(Clone, Copy, Default, PartialEq)]
 struct Run {
-    bold: Option<bool>,
+    weight: Option<u16>,
     italic: Option<bool>,
     underline: Option<bool>,
     strike: Option<bool>,
     color: Option<Color>,
     size: Option<f64>,
+    /// Multiplies the text color's alpha (CSS `opacity` on an inline element).
+    opacity: Option<f64>,
+}
+
+/// An element's own `display` value, lowercase.
+fn display_of(el: &Element) -> Option<String> {
+    css::parse_inline(el.attr("style").unwrap_or(""))
+        .into_iter()
+        .rev()
+        .find(|(k, _)| k == "display")
+        .map(|(_, v)| v.trim().to_ascii_lowercase())
+}
+
+/// `inline-block` and its kin: a box of its own, placed like text.
+fn is_inline_box(el: &Element) -> bool {
+    display_of(el)
+        .is_some_and(|d| matches!(d.as_str(), "inline-block" | "inline-flex" | "inline-grid"))
 }
 
 fn text_only(el: &Element) -> bool {
     el.children.iter().all(|c| match c {
         Html::Text(_) => true,
-        Html::Element(e) => html::is_inline(&e.tag) && text_only(e),
+        Html::Element(e) => html::is_inline(&e.tag) && !is_inline_box(e) && text_only(e),
     })
 }
 
+/// Children become flex or grid items rather than flowing as text.
 fn is_flex(st: &Styles) -> bool {
-    get(st, "display").is_some_and(|d| d.contains("flex"))
+    get(st, "display").is_some_and(|d| d.contains("flex") || d.contains("grid"))
 }
 
 fn has_element_children(el: &Element) -> bool {
@@ -1421,7 +1432,27 @@ fn has_text(el: &Element) -> bool {
     })
 }
 
-fn collect_runs(nodes: &[Html], run: Run, base_fs: f64, out: &mut Vec<(char, Run)>) {
+/// Inline CSS that can't become part of a text run, for the `ignoredStyles` report.
+fn inline_unsupported(k: &str, v: &str) -> bool {
+    !matches!(
+        k,
+        "fontWeight"
+            | "fontStyle"
+            | "textDecoration"
+            | "textDecorationLine"
+            | "color"
+            | "fontSize"
+            | "opacity"
+    ) && !(k == "fontFamily" && css::is_inter(v))
+}
+
+fn collect_runs(
+    nodes: &[Html],
+    run: Run,
+    base_fs: f64,
+    out: &mut Vec<(char, Run)>,
+    ignored: &mut BTreeSet<String>,
+) {
     for c in nodes {
         match c {
             Html::Text(t) => out.extend(t.chars().map(|ch| (ch, run))),
@@ -1432,11 +1463,15 @@ fn collect_runs(nodes: &[Html], run: Run, base_fs: f64, out: &mut Vec<(char, Run
                 let mut r = run;
                 for (k, v) in &st {
                     let lower = v.to_ascii_lowercase();
+                    if inline_unsupported(k, v) {
+                        ignored.insert(k.clone());
+                    }
                     match k.as_str() {
-                        "fontWeight" => {
-                            r.bold = Some(
-                                lower == "bold" || lower.parse::<f64>().is_ok_and(|w| w >= 600.0),
-                            )
+                        "fontWeight" => r.weight = css::font_weight(v).or(r.weight),
+                        "opacity" => {
+                            if let Ok(o) = lower.parse::<f64>() {
+                                r.opacity = Some(run.opacity.unwrap_or(1.0) * o.clamp(0.0, 1.0));
+                            }
                         }
                         "fontStyle" => r.italic = Some(lower == "italic"),
                         "textDecoration" | "textDecorationLine" => {
@@ -1450,7 +1485,7 @@ fn collect_runs(nodes: &[Html], run: Run, base_fs: f64, out: &mut Vec<(char, Run
                         _ => {}
                     }
                 }
-                collect_runs(&e.children, r, base_fs, out);
+                collect_runs(&e.children, r, base_fs, out, ignored);
             }
         }
     }
@@ -1524,8 +1559,9 @@ impl Builder<'_, '_> {
         let Some(ca) = parent.cross() else { return };
         let explicit = get(styles, if ca == 0 { "width" } else { "height" }).is_some()
             || get(styles, "alignSelf").is_some_and(|v| v != "stretch")
+            || get(styles, "display").is_some_and(|v| v.starts_with("inline"))
             || matches!(get(styles, "position"), Some("absolute" | "fixed"));
-        if parent.stretch && parent.definite[ca] && !explicit {
+        if parent.stretch && !explicit {
             n.layout_child.sizing[ca] = Sizing::Fill;
             if ca == 0
                 && let NodeKind::Text { auto_width, .. } = &mut n.kind
@@ -1574,7 +1610,12 @@ impl Builder<'_, '_> {
         };
         for h in list {
             match h {
-                Html::Element(e) if flex_items || !html::is_inline(&e.tag) || !text_only(e) => {
+                Html::Element(e)
+                    if flex_items
+                        || !html::is_inline(&e.tag)
+                        || is_inline_box(e)
+                        || !text_only(e) =>
+                {
                     flush(self, &mut inline, &mut out, index);
                     out.extend(self.element(e, inherited, parent, index));
                 }
@@ -1625,7 +1666,10 @@ impl Builder<'_, '_> {
                     k.starts_with("background")
                         || k.starts_with("border") && v != "none" && v != "0"
                         || k.starts_with("padding")
-                        || k == "display" && v.contains("flex")
+                        || k == "boxShadow"
+                        || k == "height"
+                        || k == "minHeight"
+                        || k == "display" && (v.contains("flex") || v.contains("grid"))
                 }) || matches!(el.tag.as_str(), "button" | "li" | "a")
                     && own.iter().any(|(k, _)| k.starts_with("padding"));
                 if boxy {
@@ -1664,10 +1708,23 @@ impl Builder<'_, '_> {
             .unwrap_or(16.0);
         let pre = get(&styles, "whiteSpace").is_some_and(|v| v.starts_with("pre"));
         let mut chars = Vec::new();
-        collect_runs(&el.children, Run::default(), fs, &mut chars);
-        let chars = collapse(chars, pre);
+        collect_runs(
+            &el.children,
+            Run::default(),
+            fs,
+            &mut chars,
+            &mut self.ignored,
+        );
+        let mut chars = collapse(chars, pre);
         if chars.is_empty() {
             return None;
+        }
+        if let Some(mode) = get(&styles, "textTransform") {
+            let mut plain: Vec<char> = chars.iter().map(|(c, _)| *c).collect();
+            css::transform_text(&mut plain, mode);
+            for ((c, _), up) in chars.iter_mut().zip(plain) {
+                *c = up;
+            }
         }
         let content: String = chars.iter().map(|(c, _)| *c).collect();
         let mut n = Node::new(
@@ -1682,6 +1739,9 @@ impl Builder<'_, '_> {
         );
         n.id = self.tx.alloc_id();
         n.style.set_fill(Some(Color::BLACK));
+        // CSS text fits the space it gets, and can shrink and wrap to do so.
+        n.layout_child.sizing[0] = Sizing::Hug;
+        n.layout_child.shrink = Some(1.0);
         n.name = Self::layer_name(el).unwrap_or_else(|| {
             content
                 .lines()
@@ -1692,8 +1752,15 @@ impl Builder<'_, '_> {
                 .collect()
         });
         Self::stretch_default(parent, &mut n, &styles);
-        let a = css::apply(&mut n, &styles, &parent.ctx());
+        // `text-transform` is already in the characters.
+        let styled: Styles = styles
+            .iter()
+            .filter(|(k, _)| k != "textTransform")
+            .cloned()
+            .collect();
+        let a = css::apply(&mut n, &styled, &parent.ctx());
         self.note(&a);
+        let base_color = n.style.fill().unwrap_or(Color::BLACK);
         // Rich text runs.
         let mut i = 0;
         while i < chars.len() {
@@ -1704,8 +1771,9 @@ impl Builder<'_, '_> {
             }
             if r != Run::default() {
                 n.text_style.apply_range(i, j, |s| {
-                    if r.bold.is_some() {
-                        s.bold = r.bold;
+                    if let Some(w) = r.weight {
+                        s.weight = Some(w);
+                        s.bold = Some(w >= 600);
                     }
                     if r.italic.is_some() {
                         s.italic = r.italic;
@@ -1718,6 +1786,13 @@ impl Builder<'_, '_> {
                     }
                     if r.color.is_some() {
                         s.color = r.color;
+                    }
+                    if let Some(o) = r.opacity {
+                        let c = r.color.unwrap_or(base_color);
+                        s.color = Some(Color {
+                            a: (c.a as f64 * o).round() as u8,
+                            ..c
+                        });
                     }
                     if r.size.is_some() {
                         s.size = r.size;
@@ -1759,21 +1834,83 @@ impl Builder<'_, '_> {
                     .map_or("Frame".into(), |f| f.to_uppercase().chain(c).collect())
             }
         });
-        let flex = get(own, "display").is_some_and(|d| d.contains("flex"));
+        let display = get(own, "display").unwrap_or("");
+        let flex = display.contains("flex");
+        let grid = display.contains("grid");
+        // Block flow can't place a box by `text-align`. Children that are all inline boxes
+        // become a wrapping row, and a mix of them and blocks a column.
+        let kids: Vec<&Element> = el
+            .children
+            .iter()
+            .filter_map(|c| match c {
+                Html::Element(e) => Some(e),
+                _ => None,
+            })
+            .collect();
+        let inline_boxes = kids.iter().filter(|e| is_inline_box(e)).count();
+        let block = !flex && !grid && inline_boxes == 0;
+        let row = flex || grid || (inline_boxes > 0 && inline_boxes == kids.len());
         n.layout = Some(AutoLayout {
-            direction: if flex {
+            direction: if row {
                 Direction::Horizontal
             } else {
                 Direction::Vertical
             },
+            wrap: !flex && !grid && row,
             gap: 0.0,
             cross_gap: 0.0,
             padding: [0.0; 4],
+            mode: match (block, grid) {
+                (true, _) => LayoutMode::Block,
+                (false, true) => LayoutMode::Grid,
+                (false, false) => LayoutMode::Flex,
+            },
             ..AutoLayout::default()
         });
         n.layout_child.sizing = [Sizing::Hug, Sizing::Hug];
+        n.layout_child.shrink = Some(1.0);
         Self::stretch_default(parent, &mut n, own);
-        let a = css::apply(&mut n, own, &parent.ctx());
+        let inherited_align = own
+            .iter()
+            .rev()
+            .chain(inherited.iter().rev())
+            .find(|(k, _)| k == "textAlign")
+            .map(|(_, v)| v.as_str());
+        // An inline box sits where `text-align` puts it. Block flow can't do that, so its parent
+        // became a flex column above, and this is that column's cross axis.
+        if display.starts_with("inline")
+            && parent
+                .layout
+                .is_some_and(|l| l.direction == Direction::Vertical)
+        {
+            let parent_align = inherited
+                .iter()
+                .rev()
+                .find(|(k, _)| k == "textAlign")
+                .map(|(_, v)| v.as_str());
+            n.layout_child.align_self = Some(match parent_align {
+                Some("center") => crate::model::SelfAlign::Center,
+                Some("right" | "end") => crate::model::SelfAlign::End,
+                _ => crate::model::SelfAlign::Start,
+            });
+        }
+        // A wrapping row of inline boxes lines up by `text-align` too.
+        if let (true, Some(l)) = (row && !flex && !grid, &mut n.layout) {
+            l.align_main = match inherited_align {
+                Some("center") => crate::model::Align::Center,
+                Some("right" | "end") => crate::model::Align::End,
+                _ => crate::model::Align::Start,
+            };
+        }
+        let mut applied_own = own.to_vec();
+        if block {
+            // `display: block` is already the mode; only say so when it's explicit.
+            applied_own.retain(|(k, v)| k != "display" || v.trim() != "block");
+        } else if !flex && !grid {
+            // Inline boxes changed the mode above; the CSS value would change it back.
+            applied_own.retain(|(k, _)| k != "display");
+        }
+        let a = css::apply(&mut n, &applied_own, &parent.ctx());
         self.note(&a);
         if let Some((src, mode)) = &a.image {
             match image_asset(src) {
@@ -1800,7 +1937,10 @@ impl Builder<'_, '_> {
         } else {
             self.nodes(&el.children, &inh, &me, &mut child_index, is_flex(own));
         }
-        relayout(self.tx, Some(id));
+        // Nested frames get laid out once at the end of the call, when everything is in place.
+        if parent.id.is_none() {
+            relayout(self.tx, Some(id));
+        }
         self.place(id, &a, parent);
         Some(id)
     }
@@ -1850,8 +1990,12 @@ impl Builder<'_, '_> {
         let has_w = get(own, "width").is_some();
         let a = css::apply(&mut n, own, &parent.ctx());
         // Keep the aspect ratio when only the width was styled.
-        if has_w && get(own, "height").is_none() && n.layout_child.sizing[0] != Sizing::Fill {
-            n.rect.h = n.rect.w * natural.1 / natural.0;
+        if has_w && get(own, "height").is_none() {
+            n.layout_child.aspect = Some(natural.0 / natural.1);
+            n.layout_child.sizing[1] = Sizing::Hug;
+            if n.layout_child.sizing[0] != Sizing::Fill {
+                n.rect.h = n.rect.w * natural.1 / natural.0;
+            }
         }
         self.note(&a);
         let id = self.insert(n, parent, index);
@@ -2151,7 +2295,7 @@ fn write_html(ed: &mut Editor, a: &Args) -> ToolResult {
                 ignored: BTreeSet::new(),
                 warnings: Vec::new(),
             };
-            let flex = parent.layout.is_some();
+            let flex = parent.layout.is_some_and(|l| l.mode != LayoutMode::Block);
             let made = b.nodes(&tree, &inherited, &parent, &mut index, flex);
             // Root-level content without a position goes where the replaced node was, or
             // into free space.
@@ -2175,6 +2319,9 @@ fn write_html(ed: &mut Editor, a: &Args) -> ToolResult {
                 }
             }
             relayout(b.tx, parent_id.or(made.first().copied()));
+            for id in made.iter().skip(1).filter(|_| parent_id.is_none()) {
+                relayout(b.tx, Some(*id));
+            }
             let (ig, w) = (b.ignored, b.warnings);
             (made, ig, w)
         })
@@ -2774,7 +2921,13 @@ mod tests {
         let tree = html::parse("<p>  Hello\n   <b>bold</b> world<br> next </p>");
         let Html::Element(p) = &tree[0] else { panic!() };
         let mut chars = Vec::new();
-        collect_runs(&p.children, Run::default(), 16.0, &mut chars);
+        collect_runs(
+            &p.children,
+            Run::default(),
+            16.0,
+            &mut chars,
+            &mut BTreeSet::new(),
+        );
         let s: String = collapse(chars.clone(), false)
             .iter()
             .map(|(c, _)| *c)
@@ -2782,7 +2935,7 @@ mod tests {
         assert_eq!(s, "Hello bold world\nnext");
         let bold: String = collapse(chars, false)
             .iter()
-            .filter(|(_, r)| r.bold == Some(true))
+            .filter(|(_, r)| r.weight == Some(700))
             .map(|(c, _)| *c)
             .collect();
         assert_eq!(bold, "bold");

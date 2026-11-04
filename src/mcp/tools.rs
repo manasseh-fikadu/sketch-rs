@@ -1,8 +1,7 @@
 //! Tool catalogue: names, descriptions and input schemas.
 //!
-//! Names and argument shapes follow Paper's MCP server where Sketch has an equivalent
-//! (`analysis/paper-mcp.md` §2), so agent prompts written for Paper carry over. Sketch
-//! additions: `create_shape` (whiteboard shapes and arrows), `select_nodes`, `undo`, `redo`.
+//! Names and argument shapes follow Paper's public MCP tools where Sketch has an equivalent, so
+//! agent prompts written for Paper carry over. Sketch additions: `create_shape` (whiteboard shapes and arrows), `select_nodes`, `undo`, `redo`.
 
 use serde_json::{Value, json};
 
@@ -16,9 +15,10 @@ looking at). Use list_resources / open_file / create_file to pick a project.
 - pageId defaults to the page the user is viewing; pass it to work on another page without \
 switching the user's view. Node ids are opaque strings; never show them to the user.
 - Build UI with create_artboard, then write_html into it, one visual group per call (a header, \
-a row, a card) so the user sees progress. Inline styles only; flexbox (display:flex, gap, \
-padding, align-items, justify-content) is the layout model; no margin, grid or tables.
-- Text uses Inter (regular, bold, italic). Use px for font sizes.
+a row, a card) so the user sees progress. Inline styles only. Flexbox, CSS grid, block flow, \
+margin, box-shadow, per-side borders and translate transforms all work; no tables. A call's \
+ignoredStyles lists any CSS that had no effect, so read it and adjust.
+- Text uses Inter (weights 400, 500, 600 and 700, plus italic). Use px for font sizes.
 - Edit with update_styles, set_text_content, rename_nodes, duplicate_nodes, move_nodes, \
 delete_nodes. Whiteboard shapes, sticky notes and arrows: create_shape. Hand-drawn style: \
 update_styles with {\"sketch\": true, \"roughness\": 1, \"fillStyle\": \"hachure\"}.
@@ -230,7 +230,8 @@ pub fn definitions() -> Vec<Value> {
         tool(
             "get_font_family_info",
             "Whether font families are available and their weights/styles. Sketch renders text \
-             with Inter (400, 700, normal and italic); other families fall back to Inter.",
+             with Inter (400, 500, 600 and 700 upright; 400 and 700 italic); other families fall \
+             back to Inter.",
             json!({"familyNames": {"type": "array", "items": {"type": "string"}}}),
             &["familyNames"],
             true,
@@ -302,16 +303,18 @@ pub fn definitions() -> Vec<Value> {
              one visual group (a header, one list row, a card) so the user sees progress.\n\
              - mode \"insert-children\" appends the HTML inside targetNodeId (\"root\" = the page); \
              \"replace\" replaces targetNodeId with it.\n\
-             - Inline styles only. Flexbox (display:flex, flex-direction, gap, padding, \
-             align-items, justify-content, flex-grow, flex-wrap) is the layout model; block \
-             elements stack vertically. position:absolute with left/top is supported. No margin, \
-             grid or tables.\n\
-             - Text: font-size, font-weight (≥600 = bold), font-style, color, line-height, \
-             letter-spacing, text-align, text-decoration; <b>/<i>/<u>/<s>/<span style> make rich \
+             - Inline styles only. Layout: flexbox (flex-direction, gap, flex, flex-wrap, \
+             align-items, align-self, justify-content), CSS grid (grid-template-columns/rows, \
+             grid-column/row), block flow with margin, position:absolute/relative with \
+             top/right/bottom/left, min/max-width/height, aspect-ratio. No tables. Everything \
+             measures as box-sizing:border-box.\n\
+             - Text: font-size, font-weight, font-style, color, line-height, letter-spacing, \
+             text-align, text-decoration, text-transform; <b>/<i>/<u>/<s>/<span style> make rich \
              text. Font family is always Inter.\n\
-             - Boxes: background(-color/-image: colors, linear/radial gradients, url()), border, \
-             border-radius, opacity, overflow:hidden, mix-blend-mode, width/height (px, %, \
-             fit-content).\n\
+             - Boxes: background(-color/-image: colors, linear/radial gradients, url()), border \
+             (also per side), border-radius, box-shadow (also inset), opacity, overflow:hidden, \
+             mix-blend-mode, transform:translate(), width/height (px, %, fit-content).\n\
+             - The result's ignoredStyles lists CSS that had no effect.\n\
              - <img src> takes paper-asset:///abs/path, file:// URLs, absolute paths or data: URIs. \
              <svg> markup is imported as vector layers.\n\
              - layer-name=\"...\" names layers; <x-sketch-clone node-id=\"ID\" style=\"...\"/> \
@@ -500,13 +503,20 @@ svg → vector layers; br → line break; x-sketch-clone node-id=ID → copy of 
 Default sizes (like CSS): h1 32px bold, h2 24px bold, h3 20px bold, h4–h6 16px bold, p 16px,
 small 13px, code/pre 14px; color is inherited, default black.
 
-Styles: width, height (px, %, fit-content), left/top/right/bottom with position:absolute,
-display (flex, block, none), flex-direction, flex-wrap, gap, row-gap, column-gap, padding*,
-justify-content, align-items, align-self, flex-grow, overflow, background, background-color,
+Everything measures as box-sizing:border-box, and elements have no default margins.
+
+Styles: width, height, min/max-width/height (px, %, fit-content), aspect-ratio, margin*,
+padding*, left/top/right/bottom with position:absolute or relative, display (flex, grid, block,
+inline-block, none), flex, flex-grow, flex-shrink, flex-basis, flex-direction, flex-wrap, gap,
+row-gap, column-gap, justify-content, align-items, align-self, grid-template-columns,
+grid-template-rows, grid-column, grid-row, overflow, background, background-color,
 background-image (url(), linear-gradient(), radial-gradient()), background-size/object-fit,
-border, border-color/width/style, border-radius (1–4 values), opacity, mix-blend-mode, color,
-font-size, font-weight, font-style, line-height, letter-spacing, text-align, text-decoration.
-Ignored (reported back): margin, grid, box-shadow, transform, filters, transitions.";
+border, border-top/right/bottom/left, border-color/width/style, border-radius (1–4 values),
+box-shadow (also inset), opacity, mix-blend-mode, transform (translate only), color, font-size,
+font-weight, font-style, line-height, letter-spacing, text-align, text-decoration,
+text-transform.
+Anything else, such as other font families, z-index, filters or transitions, has no effect and
+is reported back in ignoredStyles.";
 
 pub const GUIDE_WHITEBOARD: &str = "\
 # Whiteboard elements
