@@ -451,6 +451,7 @@ pub fn gradient(s: &str) -> Option<Paint> {
             stops,
             from: v2(0.5 - d.x, 0.5 - d.y),
             to: v2(0.5 + d.x, 0.5 + d.y),
+            css: None,
         }
     } else {
         Paint::Radial {
@@ -469,7 +470,7 @@ fn gradient_css(p: &Paint) -> Option<String> {
             .join(", ")
     };
     match p {
-        Paint::Linear { stops: s, from, to } => {
+        Paint::Linear { stops: s, from, to, .. } => {
             let a = (to.x - from.x)
                 .atan2(-(to.y - from.y))
                 .to_degrees()
@@ -1460,7 +1461,7 @@ mod tests {
 
     #[test]
     fn gradients_and_sketch() {
-        let Some(Paint::Linear { stops, from, to }) = gradient("linear-gradient(90deg, red, blue)")
+        let Some(Paint::Linear { stops, from, to, .. }) = gradient("linear-gradient(90deg, red, blue)")
         else {
             panic!()
         };

@@ -17,28 +17,41 @@ static BOLD: &[u8] = include_bytes!("../assets/fonts/Inter-Bold.ttf");
 static ITALIC: &[u8] = include_bytes!("../assets/fonts/Inter-Italic.ttf");
 static BOLD_ITALIC: &[u8] = include_bytes!("../assets/fonts/Inter-BoldItalic.ttf");
 
-/// Face index: bit 0 = bold, bit 1 = italic.
+/// Index of a bundled face: regular, bold, italic, bold italic, medium, semibold.
 pub type FaceId = u8;
 
-pub fn face_id(bold: bool, italic: bool) -> FaceId {
-    bold as u8 | (italic as u8) << 1
+const FACE_COUNT: usize = 6;
+
+/// The bundled face closest to a CSS weight, by the CSS font matching rules. Inter's Medium and
+/// SemiBold are bundled upright only, so italics fall back to the nearest italic.
+pub fn face_id(weight: u16, italic: bool) -> FaceId {
+    match (weight, italic) {
+        (..450, false) => 0,
+        (450..550, false) => 4,
+        (550..650, false) => 5,
+        (_, false) => 1,
+        (..550, true) => 2,
+        (_, true) => 3,
+    }
 }
 
 pub fn face_bytes(id: FaceId) -> &'static [u8] {
-    match id & 3 {
+    match id as usize % FACE_COUNT {
         0 => FONT_BYTES,
         1 => BOLD,
         2 => ITALIC,
-        _ => BOLD_ITALIC,
+        3 => BOLD_ITALIC,
+        4 => crate::theme::INTER_MEDIUM,
+        _ => crate::theme::INTER_SEMIBOLD,
     }
 }
 
 pub fn face_of(id: FaceId) -> &'static ttf_parser::Face<'static> {
-    static FACES: OnceLock<[ttf_parser::Face<'static>; 4]> = OnceLock::new();
+    static FACES: OnceLock<[ttf_parser::Face<'static>; FACE_COUNT]> = OnceLock::new();
     &FACES.get_or_init(|| {
-        [0, 1, 2, 3]
+        [0, 1, 2, 3, 4, 5]
             .map(|i| ttf_parser::Face::parse(face_bytes(i), 0).expect("bundled font parses"))
-    })[(id & 3) as usize]
+    })[id as usize % FACE_COUNT]
 }
 
 pub fn face() -> &'static ttf_parser::Face<'static> {
@@ -143,7 +156,7 @@ pub fn layout_rich(
         .iter()
         .zip(&styles)
         .map(|(c, s)| {
-            let (g, a) = advance_in(face_id(s.bold, s.italic), *c, s.size);
+            let (g, a) = advance_in(face_id(s.weight, s.italic), *c, s.size);
             (g, a + ls)
         })
         .collect();
@@ -215,7 +228,7 @@ pub fn layout_rich(
             let (gid, a) = adv[i];
             glyphs.push(PlacedGlyph {
                 gid,
-                face: face_id(st.bold, st.italic),
+                face: face_id(st.weight, st.italic),
                 size: st.size,
                 color: st.color,
                 x,
@@ -502,9 +515,69 @@ pub fn layout_node(n: &crate::model::Node) -> Option<TextLayout> {
     ))
 }
 
+/// A text node's content wrapped at `max_width` (`None` = no wrapping), for layout measuring.
+pub fn measure_node(n: &crate::model::Node, max_width: Option<f64>) -> Option<TextLayout> {
+    let crate::model::NodeKind::Text {
+        text,
+        font_size,
+        align,
+        ..
+    } = &n.kind
+    else {
+        return None;
+    };
+    let color = n
+        .style
+        .fills
+        .last()
+        .map_or(Color::INK, |p| p.preview_color());
+    Some(layout_rich(
+        text,
+        *font_size,
+        color,
+        &n.text_style,
+        max_width,
+        *align,
+    ))
+}
+
+/// Width of the longest unbreakable word, which is the narrowest CSS will wrap this text.
+pub fn min_content_width(n: &crate::model::Node) -> f64 {
+    let Some(l) = measure_node(n, None) else {
+        return 0.0;
+    };
+    let chars: Vec<char> = n.kind.text().map_or(Vec::new(), |t| t.chars().collect());
+    let (mut widest, mut word, mut line) = (0.0f64, 0.0f64, f64::NAN);
+    for g in &l.glyphs {
+        if chars.get(g.char_index) == Some(&' ') || g.baseline != line {
+            widest = widest.max(word);
+            word = 0.0;
+            line = g.baseline;
+        }
+        if chars.get(g.char_index) != Some(&' ') {
+            word += g.advance;
+        }
+    }
+    widest.max(word)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn weights_pick_the_closest_bundled_face() {
+        assert_eq!(face_id(400, false), 0);
+        assert_eq!(face_id(500, false), 4);
+        assert_eq!(face_id(600, false), 5);
+        assert_eq!(face_id(700, false), 1);
+        assert_eq!(face_id(900, false), 1);
+        assert_eq!(face_id(500, true), 2);
+        assert_eq!(face_id(600, true), 3);
+        for id in 0..6 {
+            assert_eq!(face_of(id).units_per_em(), face_of(0).units_per_em());
+        }
+    }
 
     #[test]
     fn layout_basic_and_newlines() {

@@ -1,7 +1,7 @@
 //! Scene nodes.
 
 use super::paint::{
-    BlendMode, Cap, InstanceLink, Join, LayoutChild, Paint, StrokeAlign, TextStyle,
+    BlendMode, Cap, GridSpec, InstanceLink, Join, LayoutChild, Paint, StrokeAlign, TextStyle,
 };
 use crate::geom::{Rect, V2};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -80,6 +80,28 @@ impl<'de> Deserialize<'de> for Color {
     }
 }
 
+/// A CSS `box-shadow`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Shadow {
+    pub x: f64,
+    pub y: f64,
+    pub blur: f64,
+    #[serde(default)]
+    pub spread: f64,
+    pub color: Color,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub inset: bool,
+}
+
+/// One side of a border whose sides differ.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct BorderSide {
+    pub width: f64,
+    /// `None` uses the style's `stroke` color.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<Color>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Style {
@@ -108,6 +130,12 @@ pub struct Style {
     /// Hand-drawn (rough.js style) rendering.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rough: Option<super::rough::Rough>,
+    /// Box shadows, in CSS order: the first paints on top.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub shadows: Vec<Shadow>,
+    /// Per-side borders (top, right, bottom, left); replaces `stroke` when set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub borders: Option<[BorderSide; 4]>,
 }
 
 fn is_default<T: Default + PartialEq>(t: &T) -> bool {
@@ -129,6 +157,8 @@ impl Default for Style {
             opacity: 1.0,
             blend: BlendMode::Normal,
             rough: None,
+            shadows: Vec::new(),
+            borders: None,
         }
     }
 }
@@ -387,6 +417,9 @@ pub struct Node {
     /// Auto layout (frames only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub layout: Option<super::paint::AutoLayout>,
+    /// Grid tracks, when `layout.mode` is grid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grid: Option<GridSpec>,
     /// How this node sizes and positions itself inside its parent frame.
     #[serde(default, skip_serializing_if = "LayoutChild::is_default")]
     pub layout_child: LayoutChild,
@@ -469,6 +502,7 @@ impl Node {
             children: Vec::new(),
             text_style: TextStyle::default(),
             layout: None,
+            grid: None,
             layout_child: LayoutChild::default(),
             component: false,
             instance: None,

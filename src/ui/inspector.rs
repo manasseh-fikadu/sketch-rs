@@ -624,10 +624,16 @@ fn geometry(ui: &mut Ui, ed: &mut Editor, ids: &[NodeId], first: &Node) {
         let r = first.rect;
         ui.horizontal(|ui| {
             if let Some(v) = num_field(ui, ed, "X  ", r.x, 1.0, f64::MIN..=f64::MAX, 92.0) {
-                apply(ed, "x", ids, |n| n.rect.x = v);
+                apply(ed, "x", ids, |n| {
+                    n.rect.x = v;
+                    n.layout_child.clear_offsets();
+                });
             }
             if let Some(v) = num_field(ui, ed, "Y  ", r.y, 1.0, f64::MIN..=f64::MAX, 92.0) {
-                apply(ed, "y", ids, |n| n.rect.y = v);
+                apply(ed, "y", ids, |n| {
+                    n.rect.y = v;
+                    n.layout_child.clear_offsets();
+                });
             }
         });
         ui.horizontal(|ui| {
@@ -742,10 +748,10 @@ fn resize(ed: &mut Editor, id: NodeId, size: crate::geom::V2) {
         let n = tx.node_mut(id).unwrap();
         n.set_rect_scaling(new);
         if (new.w - old.w).abs() > 1e-9 {
-            n.layout_child.sizing[0] = Sizing::Fixed;
+            n.layout_child.set_manual_size(0);
         }
         if (new.h - old.h).abs() > 1e-9 {
-            n.layout_child.sizing[1] = Sizing::Fixed;
+            n.layout_child.set_manual_size(1);
         }
         crate::layout::resize_children(tx, id, old, new);
     }
@@ -783,6 +789,7 @@ fn child_layout(ui: &mut Ui, ed: &mut Editor, ids: &[NodeId], first: &Node) {
                 ) {
                     apply(ed, "layout", ids, |n| {
                         n.layout_child.sizing[axis] = v;
+                        n.layout_child.percent[axis] = None;
                         if let NodeKind::Text { auto_width, .. } = &mut n.kind
                             && axis == 0
                         {
@@ -796,7 +803,10 @@ fn child_layout(ui: &mut Ui, ed: &mut Editor, ids: &[NodeId], first: &Node) {
     if in_auto {
         let mut abs = first.layout_child.absolute;
         if ui.checkbox(&mut abs, "Ignore auto layout").changed() {
-            apply(ed, "layout", ids, |n| n.layout_child.absolute = abs);
+            apply(ed, "layout", ids, |n| {
+                n.layout_child.absolute = abs;
+                n.layout_child.clear_offsets();
+            });
         }
     }
     let constrained =
@@ -1104,7 +1114,13 @@ fn fill_row(ui: &mut Ui, ed: &mut Editor, ids: &[NodeId], i: usize, p: &Paint) {
         });
     });
     // Gradient stops and geometry.
-    if let Paint::Linear { stops, from, to }
+    let css_angle = match p {
+        Paint::Linear { css, .. } => *css,
+        _ => None,
+    };
+    if let Paint::Linear {
+        stops, from, to, ..
+    }
     | Paint::Radial {
         stops,
         center: from,
@@ -1114,10 +1130,13 @@ fn fill_row(ui: &mut Ui, ed: &mut Editor, ids: &[NodeId], i: usize, p: &Paint) {
         let linear = matches!(p, Paint::Linear { .. });
         let rebuild = |stops: Vec<Stop>, a: crate::geom::V2, b: crate::geom::V2| {
             if linear {
+                // Moving the endpoints by hand replaces a direction written in CSS.
+                let keep = a == *from && b == *to;
                 Paint::Linear {
                     stops,
                     from: a,
                     to: b,
+                    css: css_angle.filter(|_| keep),
                 }
             } else {
                 Paint::Radial {

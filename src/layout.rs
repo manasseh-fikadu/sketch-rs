@@ -1,12 +1,29 @@
-//! Auto layout (Figma / CSS flexbox) and resize constraints.
+//! Auto layout and resize constraints.
 //!
-//! Behavior follows `analysis/FIGMA_NOTES.md` §3–4: children in flow are placed along the main
-//! axis with gap and padding, aligned on both axes, sized Fixed / Hug / Fill; hidden and
-//! absolute children are skipped. Hug sizes resolve bottom-up, fill sizes top-down.
+//! [Taffy](https://github.com/DioxusLabs/taffy) does the layout, so frames get real CSS flexbox,
+//! grid and block flow. This module maps nodes onto Taffy styles and writes the results back.
+//!
+//! Two kinds of frame share one engine. Frames built in the editor follow the Figma rules in
+//! `analysis/FIGMA_NOTES.md` §3–4: children never shrink, and `Sizing::Fill` shares free space
+//! equally. Frames written as CSS set the extra [`LayoutChild`] fields (`grow`, `shrink`,
+//! `margin`, ...), which turn on the CSS behavior for that child.
 
 use crate::geom::{Rect, V2, v2};
 use crate::history::Tx;
-use crate::model::{Align, AutoLayout, Constraint, Direction, Document, NodeId, NodeKind, Sizing};
+use crate::model::{
+    Align, AutoLayout, Constraint, Dim, Direction, Distribute, Document, GridPos, LayoutChild,
+    LayoutMode, Node, NodeId, NodeKind, SelfAlign, Sizing,
+};
+use taffy::prelude::{
+    AlignContent, AlignItems, Dimension, Display, FlexDirection, FlexWrap, FromFr, FromLength,
+    FromPercent, GridPlacement, GridTemplateComponent, JustifyContent, Layout, LengthPercentage,
+    LengthPercentageAuto, Line, MaxTrackSizingFunction, MinTrackSizingFunction, Position, Size,
+    Style, TaffyAuto, TaffyMaxContent, TaffyMinContent, TaffyTree, TrackSizingFunction, auto, fr,
+    length, line, max_content, min_content, minmax, percent, repeat, span,
+};
+use taffy::style::AvailableSpace;
+
+type DefaultCheapStr = String;
 
 fn main_axis(l: &AutoLayout) -> usize {
     match l.direction {
@@ -15,18 +32,9 @@ fn main_axis(l: &AutoLayout) -> usize {
     }
 }
 
+/// Position and size of a box along one axis.
 fn get(r: &Rect, axis: usize) -> (f64, f64) {
     if axis == 0 { (r.x, r.w) } else { (r.y, r.h) }
-}
-
-fn set(r: &mut Rect, axis: usize, pos: f64, size: f64) {
-    if axis == 0 {
-        r.x = pos;
-        r.w = size;
-    } else {
-        r.y = pos;
-        r.h = size;
-    }
 }
 
 /// Children that take part in the flow.
@@ -41,243 +49,514 @@ pub fn flow_children(doc: &Document, id: NodeId) -> Vec<NodeId> {
         .collect()
 }
 
-/// Intrinsic (hug) size of a node along an axis, without changing anything.
-fn hug_size(doc: &Document, id: NodeId, axis: usize) -> f64 {
-    let n = doc.get(id).unwrap();
-    let (_, cur) = get(&n.rect, axis);
-    let Some(l) = n.layout else { return cur };
-    let kids = flow_children(doc, id);
-    let pad = if axis == 0 {
-        l.padding[3] + l.padding[1]
-    } else {
-        l.padding[0] + l.padding[2]
-    };
-    let sizes: Vec<f64> = kids
-        .iter()
-        .map(|k| {
-            let kn = doc.get(*k).unwrap();
-            match kn.layout_child.sizing[axis] {
-                Sizing::Hug => hug_size(doc, *k, axis),
-                Sizing::Fill => 0.0,
-                Sizing::Fixed => get(&kn.rect, axis).1,
+// ------------------------------------------------------------------------------ grid tracks
+
+/// One grid track, as CSS writes it.
+fn track(s: &str) -> Option<TrackSizingFunction> {
+    let s = s.trim();
+    if let Some(inner) = s.strip_prefix("minmax(").and_then(|t| t.strip_suffix(')')) {
+        let (a, b) = inner.split_once(',')?;
+        return Some(minmax(track_min(a.trim())?, track_max(b.trim())?));
+    }
+    Some(match s {
+        "auto" => auto(),
+        "min-content" => min_content(),
+        "max-content" => max_content(),
+        _ => {
+            if let Some(v) = s.strip_suffix("fr") {
+                fr(v.trim().parse::<f32>().ok()?)
+            } else if let Some(v) = s.strip_suffix('%') {
+                percent(v.trim().parse::<f32>().ok()? / 100.0)
+            } else {
+                length(
+                    s.strip_suffix("px")
+                        .unwrap_or(s)
+                        .trim()
+                        .parse::<f32>()
+                        .ok()?,
+                )
             }
-        })
-        .collect();
-    if axis == main_axis(&l) && !l.wrap {
-        let gap = if l.gap_auto { 0.0 } else { l.gap };
-        pad + sizes.iter().sum::<f64>() + gap * (kids.len().saturating_sub(1)) as f64
-    } else if axis == main_axis(&l) {
-        // Wrapping: hug the widest child.
-        pad + sizes.iter().cloned().fold(0.0, f64::max)
-    } else if l.wrap {
-        // Counter axis with wrapping: lines stacked (computed from the current main size).
-        let (_, main_size) = get(&n.rect, main_axis(&l));
-        let lines = wrap_lines(doc, id, &l, main_size, &kids);
-        let cross: Vec<f64> = lines
-            .iter()
-            .map(|line| {
-                line.iter()
-                    .map(|k| get(&doc.get(*k).unwrap().rect, axis).1)
-                    .fold(0.0, f64::max)
-            })
-            .collect();
-        pad + cross.iter().sum::<f64>() + l.cross_gap * cross.len().saturating_sub(1) as f64
-    } else {
-        pad + sizes.iter().cloned().fold(0.0, f64::max)
-    }
+        }
+    })
 }
 
-fn wrap_lines(
-    doc: &Document,
-    _id: NodeId,
-    l: &AutoLayout,
-    main_size: f64,
-    kids: &[NodeId],
-) -> Vec<Vec<NodeId>> {
-    let ma = main_axis(l);
-    let inner = main_size
-        - if ma == 0 {
-            l.padding[3] + l.padding[1]
-        } else {
-            l.padding[0] + l.padding[2]
-        };
-    let mut lines: Vec<Vec<NodeId>> = vec![Vec::new()];
-    let mut x = 0.0;
-    for k in kids {
-        let s = get(&doc.get(*k).unwrap().rect, ma).1;
-        let line = lines.last_mut().unwrap();
-        if !line.is_empty() && x + l.gap + s > inner + 1e-9 {
-            lines.push(vec![*k]);
-            x = s;
-        } else {
-            x += if line.is_empty() { s } else { l.gap + s };
-            line.push(*k);
+fn track_min(s: &str) -> Option<MinTrackSizingFunction> {
+    Some(match s {
+        "auto" => MinTrackSizingFunction::AUTO,
+        "min-content" => MinTrackSizingFunction::MIN_CONTENT,
+        "max-content" => MinTrackSizingFunction::MAX_CONTENT,
+        _ => {
+            if let Some(v) = s.strip_suffix('%') {
+                MinTrackSizingFunction::from_percent(v.trim().parse::<f32>().ok()? / 100.0)
+            } else {
+                let v = s.strip_suffix("px").unwrap_or(s).trim();
+                MinTrackSizingFunction::from_length(v.parse::<f32>().ok()?)
+            }
         }
-    }
-    lines.retain(|l| !l.is_empty());
-    lines
+    })
 }
 
-/// Lay out one auto-layout frame and, recursively, its auto-layout descendants.
-/// Returns true if anything moved or resized.
-pub fn layout_frame(tx: &mut Tx, id: NodeId) -> bool {
-    let Some(l) = tx.doc().get(id).and_then(|n| n.layout) else {
-        return false;
-    };
-    let before: Vec<(NodeId, Rect)> = tx
-        .doc()
-        .subtree(id)
-        .iter()
-        .filter_map(|i| tx.doc().get(*i).map(|n| (*i, n.rect)))
-        .collect();
-
-    // 1. Children that hug resolve first (bottom-up).
-    for k in flow_children(tx.doc(), id) {
-        if tx.doc().get(k).is_some_and(|c| c.layout.is_some()) {
-            layout_frame(tx, k);
+fn track_max(s: &str) -> Option<MaxTrackSizingFunction> {
+    Some(match s {
+        "auto" => MaxTrackSizingFunction::AUTO,
+        "min-content" => MaxTrackSizingFunction::MIN_CONTENT,
+        "max-content" => MaxTrackSizingFunction::MAX_CONTENT,
+        _ => {
+            if let Some(v) = s.strip_suffix("fr") {
+                MaxTrackSizingFunction::from_fr(v.trim().parse::<f32>().ok()?)
+            } else if let Some(v) = s.strip_suffix('%') {
+                MaxTrackSizingFunction::from_percent(v.trim().parse::<f32>().ok()? / 100.0)
+            } else {
+                let v = s.strip_suffix("px").unwrap_or(s).trim();
+                MaxTrackSizingFunction::from_length(v.parse::<f32>().ok()?)
+            }
         }
-    }
-    // 2. This frame's hug size.
-    let ma = main_axis(&l);
-    let ca = 1 - ma;
-    let n = tx.doc().get(id).unwrap().clone();
-    let sizing = n.layout_child.sizing;
-    let mut rect = n.rect;
-    for axis in [0, 1] {
-        if sizing[axis] == Sizing::Hug {
-            let any_fill = flow_children(tx.doc(), id)
+    })
+}
+
+/// Parse a `grid-template-columns` or `-rows` value (`None` if any part isn't understood).
+pub fn parse_tracks(s: &str) -> Option<Vec<GridTemplateComponent<DefaultCheapStr>>> {
+    let mut out = Vec::new();
+    for part in crate::mcp::css::split_ws(s) {
+        if let Some(inner) = part
+            .strip_prefix("repeat(")
+            .and_then(|t| t.strip_suffix(')'))
+        {
+            let (count, tracks) = inner.split_once(',')?;
+            let list: Vec<TrackSizingFunction> = crate::mcp::css::split_ws(tracks.trim())
                 .iter()
-                .any(|k| tx.doc().get(*k).unwrap().layout_child.sizing[axis] == Sizing::Fill);
-            // A fill child on the main axis turns hug into fixed (Figma rule).
-            if !(any_fill && axis == ma) {
-                let s = hug_size(tx.doc(), id, axis);
-                let (p, _) = get(&rect, axis);
-                set(&mut rect, axis, p, s.max(0.0));
-            }
+                .map(|t| track(t))
+                .collect::<Option<_>>()?;
+            out.push(match count.trim() {
+                "auto-fit" => repeat("auto-fit", list),
+                "auto-fill" => repeat("auto-fill", list),
+                n => repeat(n.parse::<u16>().ok()?, list),
+            });
+        } else {
+            out.push(GridTemplateComponent::Single(track(&part)?));
         }
     }
-    if rect != n.rect {
-        tx.node_mut(id).unwrap().rect = rect;
-    }
-    arrange(tx, id, &l, rect, ma, ca);
-    let after: Vec<(NodeId, Rect)> = tx
-        .doc()
-        .subtree(id)
-        .iter()
-        .filter_map(|i| tx.doc().get(*i).map(|n| (*i, n.rect)))
-        .collect();
-    before != after
+    (!out.is_empty()).then_some(out)
 }
 
-fn arrange(tx: &mut Tx, id: NodeId, l: &AutoLayout, rect: Rect, ma: usize, ca: usize) {
-    let kids = flow_children(tx.doc(), id);
-    let pad = l.padding; // t r b l
-    let (p0m, p1m) = if ma == 0 {
-        (pad[3], pad[1])
-    } else {
-        (pad[0], pad[2])
-    };
-    let (p0c, p1c) = if ma == 0 {
-        (pad[0], pad[2])
-    } else {
-        (pad[3], pad[1])
-    };
-    let inner_m = get(&rect, ma).1 - p0m - p1m;
-    let inner_c = get(&rect, ca).1 - p0c - p1c;
+fn grid_pos(p: GridPos) -> GridPlacement {
+    match p {
+        GridPos::Auto => GridPlacement::Auto,
+        GridPos::Line(i) => line(i),
+        GridPos::Span(n) => span(n),
+    }
+}
 
-    let lines: Vec<Vec<NodeId>> = if l.wrap {
-        wrap_lines(tx.doc(), id, l, get(&rect, ma).1, &kids)
-    } else {
-        vec![kids.clone()]
+// ------------------------------------------------------------------------------ node → style
+
+fn lp(v: f64) -> LengthPercentage {
+    LengthPercentage::from_length(v as f32)
+}
+
+fn lpa(d: Option<Dim>, unset: LengthPercentageAuto) -> LengthPercentageAuto {
+    match d {
+        None => unset,
+        Some(Dim::Px(v)) => LengthPercentageAuto::from_length(v as f32),
+        Some(Dim::Pct(p)) => LengthPercentageAuto::from_percent(p as f32),
+        Some(Dim::Auto) => LengthPercentageAuto::AUTO,
+    }
+}
+
+fn dimension(d: Dim) -> Dimension {
+    match d {
+        Dim::Px(v) => Dimension::from_length(v as f32),
+        Dim::Pct(p) => Dimension::from_percent(p as f32),
+        Dim::Auto => Dimension::AUTO,
+    }
+}
+
+fn is_text(n: &Node) -> bool {
+    matches!(n.kind, NodeKind::Text { .. })
+}
+
+/// Text that keeps its natural width and never wraps (Figma's auto width, `white-space: nowrap`).
+fn nowrap_text(n: &Node) -> bool {
+    matches!(
+        n.kind,
+        NodeKind::Text {
+            auto_width: true,
+            ..
+        }
+    ) && n.layout_child.sizing[0] == Sizing::Fixed
+}
+
+/// A `Fill` child with no CSS flex values: it shares free space equally, whatever its content.
+fn figma_fill(lc: &LayoutChild, axis: usize) -> bool {
+    lc.sizing[axis] == Sizing::Fill && lc.grow.is_none()
+}
+
+/// The Figma rule that a fill child on the main axis turns its hugging parent into a fixed one.
+fn hug_held_by_fill(doc: &Document, n: &Node, axis: usize) -> bool {
+    n.layout.is_some_and(|l| {
+        l.mode == LayoutMode::Flex
+            && main_axis(&l) == axis
+            && flow_children(doc, n.id)
+                .iter()
+                .any(|k| figma_fill(&doc.get(*k).unwrap().layout_child, axis))
+    })
+}
+
+fn size_on(doc: &Document, n: &Node, axis: usize, parent: Option<&AutoLayout>) -> Dimension {
+    let (lc, own) = (&n.layout_child, if axis == 0 { n.rect.w } else { n.rect.h });
+    let fixed = Dimension::from_length(own as f32);
+    let Some(parent) = parent else {
+        // The root of a layout pass has no parent to fill, and its size is the caller's.
+        let hug = lc.sizing[axis] == Sizing::Hug && !hug_held_by_fill(doc, n, axis);
+        return if hug { Dimension::AUTO } else { fixed };
     };
-    let mut cross_cursor = p0c;
-    for line in lines {
-        // Main sizes: fixed / hug as they are; fill shares the rest equally.
-        let mut sizes: Vec<f64> = line
-            .iter()
-            .map(|k| {
-                let kn = tx.doc().get(*k).unwrap();
-                match kn.layout_child.sizing[ma] {
-                    Sizing::Fill => 0.0,
-                    _ => get(&kn.rect, ma).1,
-                }
+    if let Some(p) = lc.percent[axis] {
+        return Dimension::from_percent(p as f32);
+    }
+    let text = is_text(n);
+    match lc.sizing[axis] {
+        // A text box is always as tall as its lines; auto width means the content decides.
+        Sizing::Fixed if text && (axis == 1 || nowrap_text(n)) => Dimension::AUTO,
+        Sizing::Fixed => fixed,
+        Sizing::Hug if !text && n.layout.is_none() => fixed,
+        Sizing::Hug if hug_held_by_fill(doc, n, axis) => fixed,
+        Sizing::Hug => Dimension::AUTO,
+        Sizing::Fill => match parent.mode {
+            LayoutMode::Block if axis == 1 => Dimension::from_percent(1.0),
+            _ => Dimension::AUTO,
+        },
+    }
+}
+
+fn style_of(doc: &Document, n: &Node, parent: Option<&AutoLayout>) -> Style {
+    let lc = &n.layout_child;
+    // Every frame is a containing block, as in Figma: an absolute child offsets from its parent.
+    let mut st = Style {
+        position: Position::Relative,
+        ..Style::default()
+    };
+    if let Some(l) = &n.layout {
+        st.display = match l.mode {
+            LayoutMode::Flex => Display::Flex,
+            LayoutMode::Block => Display::Block,
+            LayoutMode::Grid => Display::Grid,
+        };
+        st.flex_direction = match l.direction {
+            Direction::Horizontal => FlexDirection::Row,
+            Direction::Vertical => FlexDirection::Column,
+        };
+        st.flex_wrap = if l.wrap {
+            FlexWrap::Wrap
+        } else {
+            FlexWrap::NoWrap
+        };
+        let main_gap = if l.gap_auto { 0.0 } else { l.gap };
+        let (column, row) = match l.direction {
+            Direction::Horizontal => (main_gap, l.cross_gap),
+            Direction::Vertical => (l.cross_gap, main_gap),
+        };
+        st.gap = Size {
+            width: lp(column),
+            height: lp(row),
+        };
+        st.padding = taffy::Rect {
+            top: lp(l.padding[0]),
+            right: lp(l.padding[1]),
+            bottom: lp(l.padding[2]),
+            left: lp(l.padding[3]),
+        };
+        st.border = taffy::Rect {
+            top: lp(l.border[0]),
+            right: lp(l.border[1]),
+            bottom: lp(l.border[2]),
+            left: lp(l.border[3]),
+        };
+        let many = flow_children(doc, n.id).len() > 1;
+        st.justify_content = match (l.gap_auto && many, l.distribute, l.align_main) {
+            (true, Distribute::Between, _) => JustifyContent::SPACE_BETWEEN,
+            (true, Distribute::Around, _) => JustifyContent::SPACE_AROUND,
+            (true, Distribute::Evenly, _) => JustifyContent::SPACE_EVENLY,
+            (false, _, Align::Start) => JustifyContent::FLEX_START,
+            (false, _, Align::Center) => JustifyContent::CENTER,
+            (false, _, Align::End) => JustifyContent::FLEX_END,
+        };
+        st.align_items = match l.align_cross {
+            Align::Start => AlignItems::FLEX_START,
+            Align::Center => AlignItems::CENTER,
+            Align::End => AlignItems::FLEX_END,
+        };
+        // Wrapped lines stack from the start rather than stretching apart.
+        st.align_content = AlignContent::FLEX_START;
+        if let Some(g) = &n.grid {
+            st.grid_template_columns = parse_tracks(&g.columns).unwrap_or_default();
+            st.grid_template_rows = parse_tracks(&g.rows).unwrap_or_default();
+            st.align_items = AlignItems::STRETCH;
+            st.justify_items = AlignItems::STRETCH;
+        }
+    } else {
+        st.display = Display::Block;
+    }
+    st.size = Size {
+        width: size_on(doc, n, 0, parent),
+        height: size_on(doc, n, 1, parent),
+    };
+    let unset = LengthPercentageAuto::AUTO;
+    st.min_size = Size {
+        width: lpa(lc.min[0], unset),
+        height: lpa(lc.min[1], unset),
+    };
+    st.max_size = Size {
+        width: lpa(lc.max[0], unset),
+        height: lpa(lc.max[1], unset),
+    };
+    st.aspect_ratio = lc.aspect.map(|a| a as f32);
+    let Some(parent) = parent else {
+        return st;
+    };
+    let zero = LengthPercentageAuto::from_length(0.0);
+    st.margin = taffy::Rect {
+        top: lpa(lc.margin[0], zero),
+        right: lpa(lc.margin[1], zero),
+        bottom: lpa(lc.margin[2], zero),
+        left: lpa(lc.margin[3], zero),
+    };
+    if lc.absolute {
+        st.position = Position::Absolute;
+        st.inset = taffy::Rect {
+            top: lpa(lc.inset[0], unset),
+            right: lpa(lc.inset[1], unset),
+            bottom: lpa(lc.inset[2], unset),
+            left: lpa(lc.inset[3], unset),
+        };
+    } else if lc.shift != [0.0; 2] {
+        st.inset = taffy::Rect {
+            top: lpa(Some(Dim::Px(lc.shift[1])), unset),
+            left: lpa(Some(Dim::Px(lc.shift[0])), unset),
+            right: unset,
+            bottom: unset,
+        };
+    }
+    st.flex_shrink = lc.shrink.unwrap_or(0.0) as f32;
+    st.flex_grow = lc.grow.unwrap_or(0.0) as f32;
+    st.flex_basis = lc.basis.map_or(Dimension::AUTO, dimension);
+    st.align_self = lc.align_self.map(|a| match a {
+        SelfAlign::Start => AlignItems::FLEX_START,
+        SelfAlign::Center => AlignItems::CENTER,
+        SelfAlign::End => AlignItems::FLEX_END,
+        SelfAlign::Stretch => AlignItems::STRETCH,
+    });
+    if parent.mode == LayoutMode::Flex {
+        let ma = main_axis(parent);
+        if figma_fill(lc, ma) {
+            st.flex_grow = 1.0;
+            st.flex_shrink = 1.0;
+            st.flex_basis = Dimension::from_length(0.0);
+            if ma == 0 {
+                st.min_size.width = zero;
+            } else {
+                st.min_size.height = zero;
+            }
+        }
+        if lc.sizing[1 - ma] == Sizing::Fill && lc.align_self.is_none() {
+            st.align_self = Some(AlignItems::STRETCH);
+        }
+    }
+    if parent.mode == LayoutMode::Grid {
+        st.grid_column = Line {
+            start: grid_pos(lc.grid_column[0]),
+            end: grid_pos(lc.grid_column[1]),
+        };
+        st.grid_row = Line {
+            start: grid_pos(lc.grid_row[0]),
+            end: grid_pos(lc.grid_row[1]),
+        };
+    }
+    st
+}
+
+// ------------------------------------------------------------------------------ layout pass
+
+/// A node's place in the Taffy tree.
+struct Built {
+    tid: taffy::NodeId,
+    id: NodeId,
+    kids: Vec<Built>,
+}
+
+/// Whether a child takes part in its parent's layout pass. An absolute child with no offsets
+/// stays where constraints put it, as it does in Figma.
+fn in_pass(n: &Node) -> bool {
+    n.visible && (!n.layout_child.absolute || n.layout_child.inset.iter().any(Option::is_some))
+}
+
+fn build(
+    tree: &mut TaffyTree<NodeId>,
+    doc: &Document,
+    id: NodeId,
+    parent: Option<&AutoLayout>,
+) -> Option<Built> {
+    let n = doc.get(id)?;
+    let style = style_of(doc, n, parent);
+    if is_text(n) {
+        let tid = tree.new_leaf_with_context(style, id).ok()?;
+        return Some(Built {
+            tid,
+            id,
+            kids: Vec::new(),
+        });
+    }
+    let mut kids = Vec::new();
+    if let Some(l) = &n.layout {
+        for k in doc.children(Some(id)) {
+            if doc.get(*k).is_some_and(in_pass)
+                && let Some(b) = build(tree, doc, *k, Some(l))
+            {
+                kids.push(b);
+            }
+        }
+    }
+    let ids: Vec<taffy::NodeId> = kids.iter().map(|k| k.tid).collect();
+    let tid = tree.new_with_children(style, &ids).ok()?;
+    Some(Built { tid, id, kids })
+}
+
+fn measure(
+    doc: &Document,
+    id: NodeId,
+    known: Size<Option<f32>>,
+    available: Size<AvailableSpace>,
+) -> Size<f32> {
+    let Some(n) = doc.get(id) else {
+        return Size::ZERO;
+    };
+    let wrap_at = if nowrap_text(n) {
+        None
+    } else {
+        match (known.width, available.width) {
+            (Some(w), _) => Some(w as f64),
+            (None, AvailableSpace::Definite(w)) => Some(w as f64),
+            (None, AvailableSpace::MaxContent) => None,
+            (None, AvailableSpace::MinContent) => Some(crate::text::min_content_width(n)),
+        }
+    };
+    let Some(l) = crate::text::measure_node(n, wrap_at) else {
+        return Size::ZERO;
+    };
+    // Rounded up as browsers do, so text in a box sized to fit it can't wrap on rounding alone.
+    Size {
+        width: known.width.unwrap_or(l.width.ceil() as f32),
+        height: known.height.unwrap_or(l.height as f32),
+    }
+}
+
+/// Copy one node's computed box back. The root keeps its position; everything else is placed
+/// relative to its parent, which is how Taffy reports it.
+fn write_back(tx: &mut Tx, tree: &TaffyTree<NodeId>, b: &Built, root: bool) {
+    let Ok(l): Result<&Layout, _> = tree.layout(b.tid) else {
+        return;
+    };
+    let Some(n) = tx.doc().get(b.id) else {
+        return;
+    };
+    let old = n.rect;
+    let (x, y) = if root {
+        (old.x, old.y)
+    } else {
+        (l.location.x as f64, l.location.y as f64)
+    };
+    let mut r = Rect::new(x, y, l.size.width as f64, l.size.height as f64);
+    // Taffy snaps boxes to whole pixels. A snap must not push the last word of a line that fits
+    // onto a new line, so a text box may stick out of its slot by that one pixel.
+    if is_text(n) && !nowrap_text(n) {
+        let natural = crate::text::measure_node(n, None).map_or(r.w, |t| t.width);
+        if natural > r.w && natural - r.w <= 1.0 {
+            r.w = natural.ceil();
+        }
+    }
+    // CSS text fits its box. It keeps its natural width unless the box made it wrap or stretch.
+    let fit_width = (n.layout_child.sizing[0] == Sizing::Hug && is_text(n)).then(|| {
+        let natural = crate::text::measure_node(n, None).map_or(r.w, |t| t.width);
+        (r.w - natural).abs() <= 1.0
+    });
+    let flag_changes = matches!(
+        (&n.kind, fit_width),
+        (NodeKind::Text { auto_width, .. }, Some(fit)) if *auto_width != fit
+    );
+    if r != old || flag_changes {
+        let resized = (r.w - old.w).abs() > 1e-9 || (r.h - old.h).abs() > 1e-9;
+        let text = is_text(n);
+        let free_frame = n.layout.is_none();
+        let node = tx.node_mut(b.id).unwrap();
+        if text || !resized {
+            node.rect = r;
+        } else {
+            node.set_rect_scaling(r);
+        }
+        if let (NodeKind::Text { auto_width, .. }, Some(fit)) = (&mut node.kind, fit_width) {
+            *auto_width = fit;
+        }
+        if resized && free_frame && !text {
+            resize_children(tx, b.id, old, r);
+        }
+    }
+    for k in &b.kids {
+        write_back(tx, tree, k, false);
+    }
+}
+
+fn snapshot(doc: &Document, id: NodeId) -> Vec<(NodeId, Rect, bool)> {
+    doc.subtree(id)
+        .iter()
+        .filter_map(|i| {
+            doc.get(*i).map(|n| {
+                let auto = matches!(
+                    n.kind,
+                    NodeKind::Text {
+                        auto_width: true,
+                        ..
+                    }
+                );
+                (*i, n.rect, auto)
             })
-            .collect();
-        let gap = if l.gap_auto { 0.0 } else { l.gap };
-        let fixed: f64 = sizes.iter().sum::<f64>() + gap * line.len().saturating_sub(1) as f64;
-        let fills: Vec<usize> = (0..line.len())
-            .filter(|i| tx.doc().get(line[*i]).unwrap().layout_child.sizing[ma] == Sizing::Fill)
-            .collect();
-        if !fills.is_empty() && !l.wrap {
-            let share = ((inner_m - fixed) / fills.len() as f64).max(0.0);
-            for i in &fills {
-                sizes[*i] = share;
-            }
-        }
-        let used: f64 = sizes.iter().sum::<f64>() + gap * line.len().saturating_sub(1) as f64;
-        let free = inner_m - used;
-        let (mut cursor, gap) = if l.gap_auto && line.len() > 1 {
-            (
-                p0m,
-                ((inner_m - sizes.iter().sum::<f64>()) / (line.len() - 1) as f64).max(0.0),
+        })
+        .collect()
+}
+
+/// Run Taffy over a frame and everything inside it that takes part in layout.
+fn pass(tx: &mut Tx, id: NodeId) {
+    let mut tree = TaffyTree::<NodeId>::new();
+    let Some(built) = build(&mut tree, tx.doc(), id, None) else {
+        return;
+    };
+    let doc = tx.doc();
+    let computed = tree.compute_layout_with_measure(
+        built.tid,
+        Size::MAX_CONTENT,
+        |inputs, _, context, style| {
+            taffy::compute_leaf_layout(
+                inputs,
+                style,
+                |_, _| 0.0,
+                |known, available| match context {
+                    Some(text) => measure(doc, *text, known, available),
+                    None => Size::ZERO,
+                },
             )
-        } else {
-            let start = match l.align_main {
-                Align::Start => p0m,
-                Align::Center => p0m + free * 0.5,
-                Align::End => p0m + free,
-            };
-            (start, gap)
-        };
-        let line_cross = if l.wrap {
-            line.iter()
-                .map(|k| get(&tx.doc().get(*k).unwrap().rect, ca).1)
-                .fold(0.0, f64::max)
-        } else {
-            inner_c
-        };
-        for (i, k) in line.iter().enumerate() {
-            let kn = tx.doc().get(*k).unwrap();
-            let mut r = kn.rect;
-            let cs = match kn.layout_child.sizing[ca] {
-                Sizing::Fill => line_cross.max(0.0),
-                _ => get(&r, ca).1,
-            };
-            let cpos = match l.align_cross {
-                Align::Start => cross_cursor,
-                Align::Center => cross_cursor + (line_cross - cs) * 0.5,
-                Align::End => cross_cursor + line_cross - cs,
-            };
-            set(&mut r, ma, cursor, sizes[i]);
-            set(&mut r, ca, cpos, cs);
-            cursor += sizes[i] + gap;
-            if r != kn.rect {
-                let resized = (r.w - kn.rect.w).abs() > 1e-9 || (r.h - kn.rect.h).abs() > 1e-9;
-                let old = kn.rect;
-                let n = tx.node_mut(*k).unwrap();
-                if resized {
-                    n.set_rect_scaling(r);
-                } else {
-                    n.rect = r;
-                }
-                if resized {
-                    resize_children(tx, *k, old, r);
-                    fit_text_height(tx, *k);
-                }
-            }
-        }
-        cross_cursor += line_cross + l.cross_gap;
+        },
+    );
+    if computed.is_ok() {
+        write_back(tx, &tree, &built, true);
     }
-    // Fill children that are auto-layout frames lay out their own content again.
-    for k in kids {
-        if tx.doc().get(k).is_some_and(|c| c.layout.is_some()) {
-            let sub = tx.doc().get(k).unwrap();
-            let (l2, r2) = (sub.layout.unwrap(), sub.rect);
-            let ma2 = main_axis(&l2);
-            arrange(tx, k, &l2, r2, ma2, 1 - ma2);
-        }
+}
+
+/// Lay out one auto-layout frame and everything inside it. Returns true if anything moved or
+/// resized.
+pub fn layout_frame(tx: &mut Tx, id: NodeId) -> bool {
+    if tx.doc().get(id).and_then(|n| n.layout).is_none() {
+        return false;
     }
-    // Absolute children keep their constraints-based position.
+    let before = snapshot(tx.doc(), id);
+    pass(tx, id);
+    before != snapshot(tx.doc(), id)
 }
 
 /// Re-measure a text node's height after its width changed.
@@ -304,15 +583,21 @@ pub fn resize_children(tx: &mut Tx, id: NodeId, old: Rect, new: Rect) {
     let auto = n.layout.is_some();
     let kids = n.children.clone();
     if auto {
-        let l = n.layout.unwrap();
-        let ma = main_axis(&l);
-        // Absolute children still follow constraints.
+        // Absolute children with no offsets still follow constraints.
         for k in &kids {
-            if tx.doc().get(*k).is_some_and(|c| c.layout_child.absolute) {
+            if tx
+                .doc()
+                .get(*k)
+                .is_some_and(|c| c.layout_child.absolute && !in_pass(c))
+            {
                 apply_constraints(tx, *k, old, new);
             }
         }
-        arrange(tx, id, &l, new, ma, 1 - ma);
+        // A resize settles the frame's size, even one that was hugging its content.
+        let sizing = tx.doc().get(id).unwrap().layout_child.sizing;
+        tx.node_mut(id).unwrap().layout_child.sizing = [Sizing::Fixed; 2];
+        pass(tx, id);
+        tx.node_mut(id).unwrap().layout_child.sizing = sizing;
         return;
     }
     for k in kids {
@@ -564,6 +849,129 @@ mod tests {
         );
         assert_eq!(doc.get(k[2]).unwrap().rect.min(), v2(0.0, 35.0));
         assert_eq!(doc.get(f).unwrap().rect.h, 30.0 + 5.0 + 20.0);
+    }
+
+    /// A frame whose children are styled by `f`, laid out.
+    fn css_frame(
+        l: AutoLayout,
+        size: (f64, f64),
+        kids: usize,
+        f: impl Fn(usize, &mut Node),
+    ) -> (Document, Vec<NodeId>) {
+        let mut doc = Document::default();
+        let mut rec = Recording::new("t", &doc);
+        let mut tx = Tx::new(&mut doc, &mut rec);
+        let fid = tx.alloc_id();
+        let mut frame = Node::new(
+            fid,
+            NodeKind::Frame { clip: false },
+            Rect::new(0.0, 0.0, size.0, size.1),
+        );
+        frame.layout = Some(l);
+        tx.insert(frame, None, None);
+        let mut ids = Vec::new();
+        for i in 0..kids {
+            let id = tx.alloc_id();
+            let mut n = Node::new(id, NodeKind::Rect, Rect::new(0.0, 0.0, 10.0, 10.0));
+            f(i, &mut n);
+            tx.insert(n, Some(fid), None);
+            ids.push(id);
+        }
+        layout_frame(&mut tx, fid);
+        (doc, ids)
+    }
+
+    const CSS: AutoLayout = AutoLayout {
+        direction: Direction::Horizontal,
+        wrap: false,
+        gap: 0.0,
+        gap_auto: false,
+        cross_gap: 0.0,
+        padding: [0.0; 4],
+        align_main: Align::Start,
+        align_cross: Align::Start,
+        mode: LayoutMode::Flex,
+        distribute: Distribute::Between,
+        border: [0.0; 4],
+    };
+
+    #[test]
+    fn percent_width_resolves_against_the_parent() {
+        let (doc, k) = css_frame(CSS, (200.0, 50.0), 1, |_, n| {
+            n.layout_child.percent[0] = Some(0.84);
+        });
+        assert_eq!(doc.get(k[0]).unwrap().rect.w, 168.0);
+    }
+
+    #[test]
+    fn margins_push_siblings_and_auto_centers() {
+        let (doc, k) = css_frame(CSS, (200.0, 50.0), 2, |i, n| {
+            if i == 1 {
+                n.layout_child.margin[3] = Some(Dim::Px(30.0));
+            }
+        });
+        assert_eq!(doc.get(k[1]).unwrap().rect.x, 40.0);
+        let (doc, k) = css_frame(CSS, (200.0, 50.0), 1, |_, n| {
+            n.layout_child.margin[1] = Some(Dim::Auto);
+            n.layout_child.margin[3] = Some(Dim::Auto);
+        });
+        assert_eq!(doc.get(k[0]).unwrap().rect.x, 95.0);
+    }
+
+    #[test]
+    fn grid_makes_equal_columns_and_spans() {
+        let mut doc = Document::default();
+        let mut rec = Recording::new("t", &doc);
+        let mut tx = Tx::new(&mut doc, &mut rec);
+        let fid = tx.alloc_id();
+        let mut f = Node::new(
+            fid,
+            NodeKind::Frame { clip: false },
+            Rect::new(0.0, 0.0, 320.0, 100.0),
+        );
+        f.layout = Some(AutoLayout {
+            mode: LayoutMode::Grid,
+            gap: 10.0,
+            ..CSS
+        });
+        f.grid = Some(crate::model::GridSpec {
+            columns: "repeat(3, 1fr)".into(),
+            rows: String::new(),
+        });
+        tx.insert(f, None, None);
+        let mut ids = Vec::new();
+        for i in 0..3 {
+            let id = tx.alloc_id();
+            let mut n = Node::new(id, NodeKind::Rect, Rect::new(0.0, 0.0, 10.0, 10.0));
+            n.layout_child.sizing = [Sizing::Hug; 2];
+            n.layout_child.sizing[0] = Sizing::Fill;
+            n.layout = Some(CSS);
+            if i == 2 {
+                n.layout_child.grid_column = [GridPos::Span(2), GridPos::Auto];
+            }
+            tx.insert(n, Some(fid), None);
+            ids.push(id);
+        }
+        layout_frame(&mut tx, fid);
+        let r = |i: usize| tx.doc().get(ids[i]).unwrap().rect;
+        assert_eq!((r(0).x, r(0).w), (0.0, 100.0));
+        assert_eq!((r(1).x, r(1).w), (110.0, 100.0));
+        assert_eq!((r(2).x, r(2).w), (0.0, 210.0), "second row, spanning two");
+    }
+
+    #[test]
+    fn track_lists_parse_or_refuse() {
+        for ok in [
+            "1fr 2fr",
+            "200px 1fr",
+            "repeat(3, minmax(0, 1fr))",
+            "repeat(auto-fit, 100px)",
+        ] {
+            assert!(parse_tracks(ok).is_some(), "{ok}");
+        }
+        for bad in ["", "wat", "repeat(x, 1fr)", "minmax(1fr)"] {
+            assert!(parse_tracks(bad).is_none(), "{bad}");
+        }
     }
 
     #[test]

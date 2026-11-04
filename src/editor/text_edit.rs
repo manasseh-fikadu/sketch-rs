@@ -221,6 +221,7 @@ impl Editor {
             f(&mut probe);
             if let Some(b) = probe.bold {
                 n.text_style.bold = b;
+                n.text_style.weight = None;
             }
             if let Some(i) = probe.italic {
                 n.text_style.italic = i;
@@ -238,6 +239,7 @@ impl Editor {
             for sp in &mut n.text_style.spans {
                 if probe.bold.is_some() {
                     sp.bold = None;
+                    sp.weight = None;
                 }
                 if probe.italic.is_some() {
                     sp.italic = None;

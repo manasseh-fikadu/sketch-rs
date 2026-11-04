@@ -522,6 +522,7 @@ pub fn figma_board() -> Editor {
                 stops: stops.clone(),
                 from: v2(0.0, 0.5),
                 to: v2(1.0, 0.5),
+                css: None,
             },
             p => p.clone(),
         };

@@ -95,6 +95,7 @@ fn copy_props(main: &Node, inst: &mut Node, overrides: &[String], is_root: bool)
     }
     if !ov("layout") {
         inst.layout = main.layout;
+        inst.grid = main.grid.clone();
         inst.layout_child = main.layout_child;
     }
     if !is_root && !ov("position") {
@@ -622,6 +623,7 @@ impl Editor {
             for id in ids {
                 let n = tx.node_mut(id).unwrap();
                 n.layout = None;
+                n.grid = None;
                 n.layout_child.sizing = [Sizing::Fixed; 2];
             }
         });

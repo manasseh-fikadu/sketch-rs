@@ -174,7 +174,7 @@ pub fn paint_spec(p: &Paint, wr: Rect, opacity: f64) -> Option<PaintSpec> {
     let at = |u: V2| v2(wr.x + u.x * wr.w, wr.y + u.y * wr.h);
     Some(match p {
         Paint::Solid { color } => PaintSpec::Solid(rgba(*color, opacity)),
-        Paint::Linear { stops, from, to } => PaintSpec::Linear {
+        Paint::Linear { stops, from, to, .. } => PaintSpec::Linear {
             p0: at(*from),
             p1: at(*to),
             stops: sorted(stops),

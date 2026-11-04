@@ -48,6 +48,7 @@ fn paint(p: &usvg::Paint, opacity: f32, t: &usvg::Transform, b: Rect) -> Paint {
                 s.color.a = (s.color.a as f32 * opacity) as u8;
             }
             Paint::Linear {
+                css: None,
                 stops: st,
                 from,
                 to,
@@ -212,11 +213,9 @@ fn walk(g: &usvg::Group, opacity: f32, out: &mut Vec<Node>) {
 fn options() -> usvg::Options<'static> {
     let mut o = usvg::Options::default();
     let db = o.fontdb_mut();
-    for i in 0..4u8 {
+    for i in 0..6u8 {
         db.load_font_data(crate::text::face_bytes(i).to_vec());
     }
-    db.load_font_data(crate::theme::INTER_MEDIUM.to_vec());
-    db.load_font_data(crate::theme::INTER_SEMIBOLD.to_vec());
     db.set_sans_serif_family("Inter");
     db.set_serif_family("Inter");
     db.set_monospace_family("Inter");

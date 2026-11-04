@@ -31,6 +31,17 @@ pub enum ImageMode {
     Tile,
 }
 
+/// How a CSS `linear-gradient` direction was written. CSS measures it against the real box, so
+/// unit-box endpoints alone can't hold it: they'd skew on any box that isn't square.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CssAngle {
+    /// Degrees clockwise from "to top".
+    Deg(f64),
+    /// `to <side or corner>`; x and y are -1, 0 or 1.
+    To(i8, i8),
+}
+
 /// One fill layer. Gradient geometry is in unit-box coordinates of the node (0..1).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -42,6 +53,9 @@ pub enum Paint {
         stops: Vec<Stop>,
         from: V2,
         to: V2,
+        /// When set, this decides the direction instead of `from` and `to`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        css: Option<CssAngle>,
     },
     Radial {
         stops: Vec<Stop>,
@@ -68,6 +82,7 @@ impl Paint {
             stops: vec![Stop { pos: 0.0, color: a }, Stop { pos: 1.0, color: b }],
             from: v2(0.5, 0.0),
             to: v2(0.5, 1.0),
+            css: None,
         }
     }
     pub fn radial(a: Color, b: Color) -> Paint {
@@ -265,6 +280,9 @@ pub struct TextSpan {
     pub end: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bold: Option<bool>,
+    /// CSS weight (100..900); wins over `bold`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub italic: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -282,6 +300,9 @@ pub struct TextSpan {
 #[serde(default)]
 pub struct TextStyle {
     pub bold: bool,
+    /// CSS weight (100..900); wins over `bold`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weight: Option<u16>,
     pub italic: bool,
     /// Line height as a multiple of the font size (None = font default).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -301,7 +322,9 @@ impl TextStyle {
 /// Resolved style of one character.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CharStyle {
+    /// `weight >= 600`, for the bold toggle.
     pub bold: bool,
+    pub weight: u16,
     pub italic: bool,
     pub size: f64,
     pub color: Color,
@@ -311,8 +334,10 @@ pub struct CharStyle {
 
 impl TextStyle {
     pub fn char_style(&self, i: usize, size: f64, color: Color) -> CharStyle {
+        let weight = self.weight.unwrap_or(if self.bold { 700 } else { 400 });
         let mut s = CharStyle {
-            bold: self.bold,
+            bold: weight >= 600,
+            weight,
             italic: self.italic,
             size,
             color,
@@ -323,6 +348,11 @@ impl TextStyle {
             if i >= sp.start && i < sp.end {
                 if let Some(b) = sp.bold {
                     s.bold = b;
+                    s.weight = if b { 700 } else { 400 };
+                }
+                if let Some(w) = sp.weight {
+                    s.bold = w >= 600;
+                    s.weight = w;
                 }
                 if let Some(b) = sp.italic {
                     s.italic = b;
@@ -409,6 +439,7 @@ impl TextStyle {
             for s in self.spans.iter().filter(|s| s.start <= a && s.end >= b) {
                 any = true;
                 m.bold = s.bold.or(m.bold);
+                m.weight = s.weight.or(m.weight);
                 m.italic = s.italic.or(m.italic);
                 m.size = s.size.or(m.size);
                 m.color = s.color.or(m.color);
@@ -417,6 +448,10 @@ impl TextStyle {
                 // Later spans take precedence.
                 if s.bold.is_some() {
                     m.bold = s.bold;
+                    m.weight = s.weight;
+                }
+                if s.weight.is_some() {
+                    m.weight = s.weight;
                 }
                 if s.italic.is_some() {
                     m.italic = s.italic;
@@ -435,6 +470,7 @@ impl TextStyle {
                 }
             }
             let empty = m.bold.is_none()
+                && m.weight.is_none()
                 && m.italic.is_none()
                 && m.size.is_none()
                 && m.color.is_none()
@@ -446,8 +482,9 @@ impl TextStyle {
             match out.last_mut() {
                 Some(l)
                     if l.end == a
-                        && (l.bold, l.italic, l.size, l.color, l.underline, l.strike)
-                            == (m.bold, m.italic, m.size, m.color, m.underline, m.strike) =>
+                        && (l.bold, l.weight, l.italic, l.size)
+                            == (m.bold, m.weight, m.italic, m.size)
+                        && (l.color, l.underline, l.strike) == (m.color, m.underline, m.strike) =>
                 {
                     l.end = b
                 }
@@ -477,6 +514,37 @@ pub enum Align {
     End,
 }
 
+/// Which layout algorithm an auto-layout frame uses for its children.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LayoutMode {
+    /// CSS flexbox, which is also Figma's auto layout.
+    #[default]
+    Flex,
+    /// CSS block flow: children stack, fill the width, and vertical margins collapse.
+    Block,
+    /// CSS grid; the tracks live in [`crate::model::Node::grid`].
+    Grid,
+}
+
+/// How `gap_auto` shares free space between children.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Distribute {
+    #[default]
+    Between,
+    Around,
+    Evenly,
+}
+
+fn is_zero4(v: &[f64; 4]) -> bool {
+    *v == [0.0; 4]
+}
+
+fn is_default<T: Default + PartialEq>(t: &T) -> bool {
+    *t == T::default()
+}
+
 /// Figma-style auto layout (CSS flexbox): direction, gap, padding, alignment.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -492,6 +560,13 @@ pub struct AutoLayout {
     pub padding: [f64; 4],
     pub align_main: Align,
     pub align_cross: Align,
+    #[serde(skip_serializing_if = "is_default")]
+    pub mode: LayoutMode,
+    #[serde(skip_serializing_if = "is_default")]
+    pub distribute: Distribute,
+    /// Border widths that take up layout space, as CSS borders do: top, right, bottom, left.
+    #[serde(skip_serializing_if = "is_zero4")]
+    pub border: [f64; 4],
 }
 
 impl Default for AutoLayout {
@@ -505,6 +580,9 @@ impl Default for AutoLayout {
             padding: [10.0; 4],
             align_main: Align::Start,
             align_cross: Align::Start,
+            mode: LayoutMode::Flex,
+            distribute: Distribute::Between,
+            border: [0.0; 4],
         }
     }
 }
@@ -541,20 +619,115 @@ pub struct Constraints {
     pub v: Constraint,
 }
 
-/// Per-node layout participation (as a child of an auto-layout or constrained frame).
+/// A CSS length that may depend on the parent.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Dim {
+    Px(f64),
+    /// A fraction of the parent (0.5 = 50%).
+    Pct(f64),
+    Auto,
+}
+
+/// One end of a CSS `grid-column` or `grid-row`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GridPos {
+    #[default]
+    Auto,
+    Line(i16),
+    Span(u16),
+}
+
+/// Cross-axis placement of one child, overriding the parent's `align_cross`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SelfAlign {
+    Start,
+    Center,
+    End,
+    Stretch,
+}
+
+/// A CSS grid's tracks, as written (`repeat(3, 1fr)`); [`crate::layout`] parses them.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GridSpec {
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub columns: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub rows: String,
+}
+
+/// Per-node layout participation (as a child of an auto-layout or constrained frame).
+///
+/// `sizing`, `absolute` and `constraints` are what the editor's panels set. The rest come from
+/// CSS through the MCP tools, and all of them default to "not set".
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LayoutChild {
     /// Horizontal and vertical sizing.
     pub sizing: [Sizing; 2],
-    /// Ignore auto layout (positioned by constraints instead).
+    /// Ignore auto layout (positioned by `inset` if set, else by constraints).
     pub absolute: bool,
     pub constraints: Constraints,
+    /// Width and height as a fraction of the parent; wins over `sizing`.
+    #[serde(skip_serializing_if = "is_default")]
+    pub percent: [Option<f64>; 2],
+    /// Minimum width and height.
+    #[serde(skip_serializing_if = "is_default")]
+    pub min: [Option<Dim>; 2],
+    /// Maximum width and height.
+    #[serde(skip_serializing_if = "is_default")]
+    pub max: [Option<Dim>; 2],
+    /// Top, right, bottom, left.
+    #[serde(skip_serializing_if = "is_default")]
+    pub margin: [Option<Dim>; 4],
+    /// Offsets of an absolute child: top, right, bottom, left.
+    #[serde(skip_serializing_if = "is_default")]
+    pub inset: [Option<Dim>; 4],
+    /// Visual shift that leaves siblings in place (CSS `transform: translate`, relative offsets).
+    #[serde(skip_serializing_if = "is_default")]
+    pub shift: [f64; 2],
+    /// CSS `flex-grow`. Unset means the Figma rule: `Sizing::Fill` shares space equally.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grow: Option<f64>,
+    /// CSS `flex-shrink`. Unset means the Figma rule: children never shrink.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shrink: Option<f64>,
+    /// CSS `flex-basis`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub basis: Option<Dim>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub align_self: Option<SelfAlign>,
+    /// Width divided by height.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aspect: Option<f64>,
+    /// `grid-column` start and end.
+    #[serde(skip_serializing_if = "is_default")]
+    pub grid_column: [GridPos; 2],
+    /// `grid-row` start and end.
+    #[serde(skip_serializing_if = "is_default")]
+    pub grid_row: [GridPos; 2],
 }
 
 impl LayoutChild {
     pub fn is_default(&self) -> bool {
         *self == LayoutChild::default()
+    }
+
+    /// The user sized this axis by hand, so CSS that would override it stops applying.
+    pub fn set_manual_size(&mut self, axis: usize) {
+        self.sizing[axis] = Sizing::Fixed;
+        self.percent[axis] = None;
+        self.min[axis] = None;
+        self.max[axis] = None;
+    }
+
+    /// The user moved this node by hand, so CSS offsets that would put it back stop applying.
+    pub fn clear_offsets(&mut self) {
+        self.inset = [None; 4];
+        self.shift = [0.0; 2];
     }
 }
 

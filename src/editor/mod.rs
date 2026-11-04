@@ -1089,6 +1089,12 @@ impl Editor {
                     origins = new.iter().copied().zip(world).collect();
                     self.selection = new;
                 }
+                // A drag replaces any CSS offsets that would otherwise put these back.
+                for (id, _) in &origins {
+                    if let Some(n) = self.tx().node_mut(*id) {
+                        n.layout_child.clear_offsets();
+                    }
+                }
                 // Auto-layout parents hold still while their children are dragged around.
                 self.layout_suspended = origins
                     .iter()
@@ -1216,10 +1222,10 @@ impl Editor {
                         n.set_rect_scaling(new);
                         // Manual resizing fixes the size (no more hug/fill) on that axis.
                         if (new.w - old.w).abs() > 1e-9 {
-                            n.layout_child.sizing[0] = crate::model::Sizing::Fixed;
+                            n.layout_child.set_manual_size(0);
                         }
                         if (new.h - old.h).abs() > 1e-9 {
-                            n.layout_child.sizing[1] = crate::model::Sizing::Fixed;
+                            n.layout_child.set_manual_size(1);
                         }
                     }
                     let group = tx.doc().get(*id).is_some_and(|n| n.is_group());
@@ -1925,6 +1931,7 @@ impl Editor {
                             let n = tx.node_mut(id).unwrap();
                             n.rect.x += dx;
                             n.rect.y += dy;
+                            n.layout_child.clear_offsets();
                         }
                     });
                 }
