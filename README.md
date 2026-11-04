@@ -315,10 +315,11 @@ Known gaps), ⏳ planned in a later milestone, ❌ not planned.
   innermost rounded clipping frame rounds its corners.
 * **Booleans are destructive**: the result is a new vector path with flattened curves.
   Gradients are edited in the inspector only.
-* **macOS testing is thin.** Upstream ran its build on an M4 Pro Mac, where the window opens on
-  Metal and MCP edits land, but it didn't test mouse, trackpad and keyboard input or the menus. In
-  this fork, macOS is only compile-checked so far. On Linux, the real window was exercised under
-  Xvfb; the screenshot is `x11_window_xvfb.png`.
+* **macOS hand testing is missing.** On a clean arm64 macOS 26 runner, this fork builds, passes
+  the full test suite, opens its window on Metal, connects to Claude Code and takes designs over
+  MCP with the same fidelity scores as Linux. Nobody has yet tried mouse, trackpad and keyboard
+  input or the menus by hand, and Intel Macs are untested. On Linux, the real window was exercised
+  under Xvfb; the screenshot is `x11_window_xvfb.png`.
 * **Pen pressure.** winit 0.30 does not expose tablet pressure for pen events that arrive as
   mouse input, which is common with macOS and Wacom tablets. Pressure comes from touch/pen
   `force` when the platform reports it. Otherwise it is simulated from stroke velocity.
