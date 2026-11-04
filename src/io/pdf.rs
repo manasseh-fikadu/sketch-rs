@@ -8,9 +8,9 @@
 use crate::assets;
 use crate::geom::{Rect, V2};
 use crate::model::{BlendMode, Cap, Color, Document, Join, NodeId, NodeKind, Stop};
-use crate::render::draw::{self, DrawOp, PaintSpec};
+use crate::render::draw::{self, DrawOp, PaintSpec, ShadowOp};
 use crate::text;
-use crate::vector::{Seg, VPath};
+use crate::vector::{self, Seg, VPath};
 use std::collections::HashMap;
 use std::fmt::Write;
 
@@ -268,6 +268,52 @@ impl PageWriter<'_> {
         Some(name)
     }
 
+    /// PDF has no blur, so a shadow is a stack of faint rounded boxes, each a little smaller and
+    /// each adding a step of alpha, under a clip that keeps it out of the box (or inside it).
+    fn shadow(&mut self, s: &ShadowOp, blend: BlendMode) {
+        const BANDS: usize = 12;
+        let outer = vector::rounded_rect(s.bounds().union(&s.box_rect).inflate(1.0), [0.0; 4]);
+        let boxp = vector::rounded_rect(s.box_rect, s.box_radii);
+        let clip = if s.inset {
+            let p = self.emit_path(&boxp);
+            format!("{p}W n")
+        } else {
+            let mut hole = outer.clone();
+            hole.append(&boxp);
+            let p = self.emit_path(&hole);
+            format!("{p}W* n")
+        };
+        let _ = writeln!(self.out, "q {clip}");
+        let mut bands = Vec::with_capacity(BANDS);
+        let step = s.color[3] / BANDS as f32;
+        for i in 0..BANDS {
+            let t = (i as f64 + 0.5) / BANDS as f64;
+            let d = (1.0 - 2.0 * t) * 2.0 * s.sigma;
+            let r = s.shape.inflate(d);
+            if r.w <= 0.0 || r.h <= 0.0 {
+                continue;
+            }
+            let band = vector::rounded_rect(r, s.shape_radii.map(|x| (x + d).max(0.0)));
+            let path = if s.inset {
+                let mut p = outer.clone();
+                p.append(&band);
+                p
+            } else {
+                band
+            };
+            bands.push(DrawOp::Fill {
+                path,
+                paint: PaintSpec::Solid([s.color[0], s.color[1], s.color[2], step]),
+                even_odd: s.inset,
+            });
+        }
+        if s.inset {
+            bands.reverse();
+        }
+        self.ops(&bands, blend);
+        self.out.push_str("Q\n");
+    }
+
     fn ops(&mut self, ops: &[DrawOp], blend: BlendMode) {
         for op in ops {
             match op {
@@ -401,6 +447,7 @@ impl PageWriter<'_> {
                         d.join(" ")
                     );
                 }
+                DrawOp::Shadow(s) => self.shadow(s, blend),
                 DrawOp::Glyphs {
                     face,
                     size,

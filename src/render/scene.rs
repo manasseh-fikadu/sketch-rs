@@ -75,6 +75,14 @@ pub fn grid(mb: &mut MeshBuilder, v: &View) {
 
 // ---------------------------------------------------------------------------------- world scene
 
+/// What clipping frames around a node ask for. Only the innermost rounded clip applies; outer
+/// ones still clip to their bounding rectangle.
+#[derive(Clone, Copy, Default)]
+struct ClipScope {
+    rect: Option<Rect>,
+    round: u32,
+}
+
 /// One node's cached triangles plus where they are clipped and how they blend.
 #[derive(Clone)]
 pub struct Item {
@@ -82,6 +90,9 @@ pub struct Item {
     pub pieces: Arc<Vec<Piece>>,
     /// World-space clip rectangle (from clipping frames).
     pub clip: Option<Rect>,
+    /// Param atlas row of the nearest rounded clipping frame (0 = none). `clip` is its bounds,
+    /// so the GPU scissors first and only feathers the corners.
+    pub round_clip: u32,
     pub blend: BlendMode,
 }
 
@@ -138,8 +149,9 @@ impl SceneCache {
         for id in roots.unwrap_or(&all) {
             let op = draw::inherited_opacity(doc, *id);
             let origin = doc.parent_origin(doc.get(*id).and_then(|n| n.parent));
+            let scope = ClipScope::default();
             self.walk(
-                doc, *id, origin, None, op, bucket, &mut tess, cull, &mut out,
+                doc, *id, origin, scope, op, bucket, &mut tess, cull, &mut out,
             );
         }
         // Evict entries for deleted or long-unseen nodes when the cache grows large.
@@ -156,7 +168,7 @@ impl SceneCache {
         doc: &Document,
         id: NodeId,
         origin: V2,
-        clip: Option<Rect>,
+        scope: ClipScope,
         parent_opacity: f64,
         bucket: i32,
         tess: &mut Tess,
@@ -167,6 +179,7 @@ impl SceneCache {
         if !n.visible {
             return;
         }
+        let clip = scope.rect;
         let wr = n.rect.translate(origin);
         let opacity = parent_opacity * n.style.opacity;
         let bounds = draw::draw_bounds(n, wr);
@@ -199,6 +212,7 @@ impl SceneCache {
                     id,
                     pieces: e.pieces.clone(),
                     clip,
+                    round_clip: scope.round,
                     blend: n.style.blend,
                 });
             }
@@ -206,14 +220,22 @@ impl SceneCache {
         if n.children.is_empty() {
             return;
         }
-        let child_clip = match n.kind {
+        let child_scope = match n.kind {
             NodeKind::Frame { clip: true } => {
-                match clip.map_or(Some(wr), |c| c.intersection(&wr)) {
-                    Some(c) => Some(c),
-                    None => return,
+                let Some(rect) = clip.map_or(Some(wr), |c| c.intersection(&wr)) else {
+                    return;
+                };
+                let radii = n.style.corner_radii();
+                ClipScope {
+                    rect: Some(rect),
+                    round: if radii.iter().any(|r| *r > 0.0) {
+                        super::tess::clip_row(wr, radii)
+                    } else {
+                        scope.round
+                    },
                 }
             }
-            _ => clip,
+            _ => scope,
         };
         if matches!(n.kind, NodeKind::Frame { clip: true })
             && cull.is_some_and(|c| !c.intersects(&wr))
@@ -222,7 +244,7 @@ impl SceneCache {
         }
         let o = wr.min();
         for c in &n.children {
-            self.walk(doc, *c, o, child_clip, opacity, bucket, tess, cull, out);
+            self.walk(doc, *c, o, child_scope, opacity, bucket, tess, cull, out);
         }
     }
 }

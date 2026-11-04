@@ -4,8 +4,9 @@
 use crate::assets;
 use crate::geom::Rect;
 use crate::model::{BlendMode, Color, Document, NodeId, NodeKind, Stop};
-use crate::render::draw::{self, DrawOp, PaintSpec};
+use crate::render::draw::{self, DrawOp, PaintSpec, ShadowOp};
 use crate::text;
+use crate::vector;
 use std::fmt::Write;
 
 fn esc(s: &str) -> String {
@@ -57,13 +58,21 @@ pub fn export_bounds(doc: &Document, roots: &[NodeId]) -> Option<Rect> {
             if nd.is_group() || !doc.is_effectively_visible(id) {
                 continue;
             }
-            // Children of clipping frames can't draw outside them.
-            if doc.ancestors(id).iter().any(|a| {
-                matches!(
-                    doc.get(*a).map(|x| &x.kind),
-                    Some(NodeKind::Frame { clip: true })
-                )
-            }) {
+            // Children of clipping frames can't draw outside them. Only frames being exported
+            // count: when the root sits inside a clipping artboard, the artboard isn't drawn.
+            let mut clipped = false;
+            if id != *r {
+                for a in doc.ancestors(id) {
+                    clipped |= matches!(
+                        doc.get(a).map(|x| &x.kind),
+                        Some(NodeKind::Frame { clip: true })
+                    );
+                    if a == *r {
+                        break;
+                    }
+                }
+            }
+            if clipped {
                 continue;
             }
             rects.push(draw::draw_bounds(nd, wr));
@@ -160,6 +169,38 @@ impl Writer<'_> {
             }
             PaintSpec::Image { .. } => return None,
         })
+    }
+
+    /// A real SVG blur, clipped so it paints only outside the box (or only inside when inset).
+    fn shadow(&mut self, s: &ShadowOp, ind: &str) {
+        let reach = s.bounds().inflate(3.0 * s.sigma);
+        let boxd = vector::rounded_rect(s.box_rect, s.box_radii).to_svg();
+        let shape = vector::rounded_rect(s.shape, s.shape_radii).to_svg();
+        let outer = vector::rounded_rect(reach.union(&s.box_rect).inflate(1.0), [0.0; 4]).to_svg();
+        let (clip, blurred) = if s.inset {
+            (format!("<path d=\"{boxd}\"/>"), format!("{outer}{shape}"))
+        } else {
+            (
+                format!("<path d=\"{outer}{boxd}\" clip-rule=\"evenodd\"/>"),
+                shape,
+            )
+        };
+        let cid = self.def_id("c");
+        let fid = self.def_id("f");
+        let _ = write!(
+            self.defs,
+            "<clipPath id=\"{cid}\">{clip}</clipPath><filter id=\"{fid}\" filterUnits=\"userSpaceOnUse\" x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\"><feGaussianBlur stdDeviation=\"{}\"/></filter>",
+            n(reach.x),
+            n(reach.y),
+            n(reach.w),
+            n(reach.h),
+            n(s.sigma)
+        );
+        let _ = writeln!(
+            self.out,
+            "{ind}<g clip-path=\"url(#{cid})\"><path d=\"{blurred}\" fill-rule=\"evenodd\"{} filter=\"url(#{fid})\"/></g>",
+            color_attr("fill", s.color)
+        );
     }
 
     fn ops(&mut self, ops: &[DrawOp], ind: &str) {
@@ -267,6 +308,7 @@ impl Writer<'_> {
                         n(*width)
                     );
                 }
+                DrawOp::Shadow(s) => self.shadow(s, ind),
                 DrawOp::Glyphs {
                     face,
                     size,

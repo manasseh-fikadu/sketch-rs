@@ -1,8 +1,9 @@
 //! Draw ops → GPU triangle meshes (world space), plus the gradient ramp atlas.
 
-use super::draw::{DrawOp, PaintSpec};
+use super::draw::{DrawOp, PaintSpec, ShadowOp};
 use super::mesh::{
-    Mesh, PAINT_IMAGE, PAINT_IMAGE_TILE, PAINT_LINEAR, PAINT_RADIAL, PAINT_SOLID, Vertex,
+    Mesh, PAINT_IMAGE, PAINT_IMAGE_TILE, PAINT_LINEAR, PAINT_RADIAL, PAINT_SHADOW, PAINT_SOLID,
+    Vertex,
 };
 use crate::geom::{Rect, V2, v2};
 use crate::model::{Cap, Join, Stop, sample_stops};
@@ -64,6 +65,92 @@ pub fn gradient_row(stops: &[Stop]) -> u32 {
     a.rows.insert(key, row);
     a.version += 1;
     row
+}
+
+// ---------------------------------------------------------------------------------- params
+
+pub const PARAMS_W: u32 = 5;
+pub const PARAMS_H: u32 = 2048;
+
+/// Rows of floats the fragment shader reads with `textureLoad`: rounded clips and shadows. A
+/// texture rather than a uniform array, so a page can have thousands of them.
+pub struct ParamAtlas {
+    rows: HashMap<[u32; (PARAMS_W * 4) as usize], u32>,
+    pub texels: Vec<[f32; 4]>,
+    /// Bumps when texels change, so the GPU copy can be refreshed.
+    pub version: u64,
+}
+
+pub fn params() -> &'static Mutex<ParamAtlas> {
+    static A: OnceLock<Mutex<ParamAtlas>> = OnceLock::new();
+    A.get_or_init(|| {
+        Mutex::new(ParamAtlas {
+            rows: HashMap::new(),
+            texels: vec![[0.0; 4]; (PARAMS_W * PARAMS_H) as usize],
+            version: 1,
+        })
+    })
+}
+
+/// Atlas row for a block of params (allocated on first use; wraps when full). Row 0 stays empty,
+/// so 0 can mean "no params".
+pub fn param_row(data: [[f32; 4]; PARAMS_W as usize]) -> u32 {
+    let flat: Vec<u32> = data.iter().flatten().map(|f| f.to_bits()).collect();
+    let key: [u32; (PARAMS_W * 4) as usize] = flat.try_into().unwrap();
+    let mut a = params().lock().unwrap();
+    if let Some(r) = a.rows.get(&key) {
+        return *r;
+    }
+    let row = (a.rows.len() as u32 % (PARAMS_H - 1)) + 1;
+    let start = (row * PARAMS_W) as usize;
+    a.texels[start..start + PARAMS_W as usize].copy_from_slice(&data);
+    a.rows.insert(key, row);
+    a.version += 1;
+    row
+}
+
+fn rect4(r: Rect) -> [f32; 4] {
+    [r.x as f32, r.y as f32, r.w as f32, r.h as f32]
+}
+
+/// Radii as the shader wants them: never past half the box, as CSS and `rounded_rect` do.
+fn radii4(r: Rect, radii: [f64; 4]) -> [f32; 4] {
+    let max = (r.w.min(r.h) * 0.5).max(0.0);
+    radii.map(|x| x.clamp(0.0, max) as f32)
+}
+
+/// Row of a rounded clip, for [`Vertex::clip`].
+pub fn clip_row(r: Rect, radii: [f64; 4]) -> u32 {
+    param_row([rect4(r), radii4(r, radii), [0.0; 4], [0.0; 4], [0.0; 4]])
+}
+
+fn shadow_mesh(op: &ShadowOp) -> Mesh {
+    let row = param_row([
+        rect4(op.shape),
+        radii4(op.shape, op.shape_radii),
+        rect4(op.box_rect),
+        radii4(op.box_rect, op.box_radii),
+        [op.sigma as f32, op.inset as u32 as f32, 0.0, 0.0],
+    ]);
+    let r = op.bounds();
+    let corners = [
+        [r.x, r.y],
+        [r.right(), r.y],
+        [r.right(), r.bottom()],
+        [r.x, r.bottom()],
+    ];
+    Mesh {
+        vertices: corners
+            .map(|p| Vertex {
+                pos: [p[0] as f32, p[1] as f32],
+                color: op.color,
+                uv: [0.0; 2],
+                kind: PAINT_SHADOW | row << 8,
+                clip: 0,
+            })
+            .to_vec(),
+        indices: vec![0, 1, 2, 0, 2, 3],
+    }
 }
 
 // ---------------------------------------------------------------------------------- tessellation
@@ -131,6 +218,7 @@ impl Tess {
                 color,
                 glyphs,
             } => (None, self.glyphs(*face, *size, *color, glyphs)),
+            DrawOp::Shadow(s) => (None, shadow_mesh(s)),
         }
     }
 
@@ -272,7 +360,7 @@ fn paint_fn(paint: &PaintSpec) -> (Option<String>, Box<dyn Fn(V2) -> Vertex>) {
                     color: [1.0, 1.0, 1.0, opacity],
                     uv: [((p - p0).dot(d) / l2) as f32, 0.0],
                     kind: PAINT_LINEAR | row << 8,
-                    _pad: 0,
+                    clip: 0,
                 }),
             )
         }
@@ -298,7 +386,7 @@ fn paint_fn(paint: &PaintSpec) -> (Option<String>, Box<dyn Fn(V2) -> Vertex>) {
                         color: [1.0, 1.0, 1.0, opacity],
                         uv: [u as f32, v as f32],
                         kind: PAINT_RADIAL | row << 8,
-                        _pad: 0,
+                        clip: 0,
                     }
                 }),
             )
@@ -318,7 +406,7 @@ fn paint_fn(paint: &PaintSpec) -> (Option<String>, Box<dyn Fn(V2) -> Vertex>) {
                     ((p.y - place.y) / place.h.max(1e-9)) as f32,
                 ],
                 kind: if tile { PAINT_IMAGE_TILE } else { PAINT_IMAGE },
-                _pad: 0,
+                clip: 0,
             }),
         ),
     }

@@ -28,17 +28,20 @@ struct Globals {
 @group(1) @binding(1) var ramp_samp: sampler;
 @group(2) @binding(0) var img_tex: texture_2d<f32>;
 @group(2) @binding(1) var img_samp: sampler;
+@group(3) @binding(0) var params: texture_2d<f32>;
 
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
     @location(0) color: vec4<f32>,
     @location(1) uv: vec2<f32>,
     @location(2) @interpolate(flat) kind: u32,
+    @location(3) world: vec2<f32>,
+    @location(4) @interpolate(flat) clip: u32,
 };
 
 @vertex
 fn vs(@location(0) pos: vec2<f32>, @location(1) color: vec4<f32>, @location(2) uv: vec2<f32>,
-      @location(3) kind: u32) -> VsOut {
+      @location(3) kind: u32, @location(4) clip: u32) -> VsOut {
     let logical = (pos - g.pan) * g.zoom + g.offset;
     let px = logical * g.scale;
     var o: VsOut;
@@ -46,7 +49,70 @@ fn vs(@location(0) pos: vec2<f32>, @location(1) color: vec4<f32>, @location(2) u
     o.color = color;
     o.uv = uv;
     o.kind = kind;
+    o.world = pos;
+    o.clip = clip;
     return o;
+}
+
+fn param(row: u32, i: i32) -> vec4<f32> {
+    return textureLoad(params, vec2<i32>(i, i32(row)), 0);
+}
+
+// The radius of the corner `q` (relative to the box center) is nearest to.
+fn corner(q: vec2<f32>, radii: vec4<f32>) -> f32 {
+    if (q.y < 0.0) {
+        return select(radii.x, radii.y, q.x >= 0.0);
+    }
+    return select(radii.w, radii.z, q.x >= 0.0);
+}
+
+// Signed distance to a rounded box: negative inside.
+fn sd_rrect(p: vec2<f32>, rect: vec4<f32>, radii: vec4<f32>) -> f32 {
+    let half = rect.zw * 0.5;
+    let q = p - (rect.xy + half);
+    let r = corner(q, radii);
+    let d = abs(q) - half + vec2<f32>(r);
+    return length(max(d, vec2<f32>(0.0))) + min(max(d.x, d.y), 0.0) - r;
+}
+
+// Fast rounded rectangle shadows, by Evan Wallace (CC0):
+// https://madebyevan.com/shaders/fast-rounded-rectangle-shadows/
+fn gauss(x: f32, sigma: f32) -> f32 {
+    return exp(-(x * x) / (2.0 * sigma * sigma)) / (2.5066283 * sigma);
+}
+
+fn erf2(v: vec2<f32>) -> vec2<f32> {
+    let s = sign(v);
+    let a = abs(v);
+    var x = 1.0 + (0.278393 + (0.230389 + 0.078108 * (a * a)) * a) * a;
+    x = x * x;
+    return s - s / (x * x);
+}
+
+fn shadow_x(x: f32, y: f32, sigma: f32, r: f32, half: vec2<f32>) -> f32 {
+    let delta = min(half.y - r - abs(y), 0.0);
+    let curved = half.x - r + sqrt(max(0.0, r * r - delta * delta));
+    let integral = 0.5 + 0.5 * erf2((x + vec2<f32>(-curved, curved)) * (0.70710678 / sigma));
+    return integral.y - integral.x;
+}
+
+// How much of a blurred rounded box covers `p`.
+fn box_shadow(p: vec2<f32>, rect: vec4<f32>, radii: vec4<f32>, sigma: f32) -> f32 {
+    let half = rect.zw * 0.5;
+    let q = p - (rect.xy + half);
+    let r = corner(q, radii);
+    let low = q.y - half.y;
+    let high = q.y + half.y;
+    let start = clamp(-3.0 * sigma, low, high);
+    let end = clamp(3.0 * sigma, low, high);
+    let step = (end - start) / 4.0;
+    var y = start + step * 0.5;
+    var value = 0.0;
+    for (var n = 0; n < 4; n++) {
+        value += shadow_x(q.x, q.y - y, sigma, r, half) * gauss(y, sigma) * step;
+        y += step;
+    }
+    return value;
 }
 
 fn ramp(t: f32, row: u32) -> vec4<f32> {
@@ -59,7 +125,21 @@ fn fs(i: VsOut) -> @location(0) vec4<f32> {
     let k = i.kind & 255u;
     let row = i.kind >> 8u;
     var c = i.color;
-    if (k == 1u) {
+    if (k == 5u) {
+        let shape = param(row, 0);
+        let shape_radii = param(row, 1);
+        let bx = param(row, 2);
+        let box_radii = param(row, 3);
+        let extra = param(row, 4);
+        let px = g.zoom * g.scale;
+        let shadow = box_shadow(i.world, shape, shape_radii, extra.x);
+        let outside = clamp(sd_rrect(i.world, bx, box_radii) * px + 0.5, 0.0, 1.0);
+        if (extra.y > 0.5) {
+            c.a *= (1.0 - shadow) * (1.0 - outside);
+        } else {
+            c.a *= shadow * outside;
+        }
+    } else if (k == 1u) {
         let r = ramp(i.uv.x, row);
         c = vec4<f32>(r.rgb, r.a * i.color.a);
     } else if (k == 2u) {
@@ -71,6 +151,10 @@ fn fs(i: VsOut) -> @location(0) vec4<f32> {
         }
         let t = textureSample(img_tex, img_samp, i.uv);
         c = vec4<f32>(t.rgb, t.a * i.color.a);
+    }
+    if (i.clip != 0u) {
+        let d = sd_rrect(i.world, param(i.clip, 0), param(i.clip, 1));
+        c.a *= clamp(0.5 - d * g.zoom * g.scale, 0.0, 1.0);
     }
     // Premultiplied output; every pipeline blends premultiplied.
     return vec4<f32>(c.rgb * c.a, c.a);
@@ -131,6 +215,9 @@ fn blend_state(key: usize) -> wgpu::BlendState {
     wgpu::BlendState { color, alpha }
 }
 
+/// (buffer identity, clip rect, blend key, rounded clip row) of one item, to spot changes.
+type WorldKey = (usize, Option<[u64; 4]>, usize, u32);
+
 /// (index range, world clip, blend key, image) of one cached world draw.
 type WorldDraw = (std::ops::Range<u32>, Option<Rect>, usize, Option<String>);
 
@@ -145,7 +232,7 @@ struct Draw {
 
 /// Cached world-space geometry: reused while the item list is unchanged (panning, idle).
 struct WorldBuffers {
-    signature: Vec<(usize, Option<[u64; 4]>, usize)>,
+    signature: Vec<WorldKey>,
     vb: Option<wgpu::Buffer>,
     ib: Option<wgpu::Buffer>,
     /// (index range, world clip, blend key, image) per draw.
@@ -161,6 +248,9 @@ pub struct CanvasRenderer {
     ramp_tex: wgpu::Texture,
     ramp_bg: wgpu::BindGroup,
     ramp_version: u64,
+    params_tex: wgpu::Texture,
+    params_bg: wgpu::BindGroup,
+    params_version: u64,
     img_layout: wgpu::BindGroupLayout,
     img_sampler: wgpu::Sampler,
     blank_img: wgpu::BindGroup,
@@ -221,7 +311,7 @@ impl CanvasRenderer {
             label: Some("canvas globals"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
@@ -326,9 +416,51 @@ impl CanvasRenderer {
                 },
             ],
         });
+        let params_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("params"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            }],
+        });
+        let params_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("params"),
+            size: wgpu::Extent3d {
+                width: tess::PARAMS_W,
+                height: tess::PARAMS_H,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let params_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("params"),
+            layout: &params_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(
+                    &params_tex.create_view(&Default::default()),
+                ),
+            }],
+        });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("canvas"),
-            bind_group_layouts: &[Some(&globals_layout), Some(&ramp_layout), Some(&img_layout)],
+            bind_group_layouts: &[
+                Some(&globals_layout),
+                Some(&ramp_layout),
+                Some(&img_layout),
+                Some(&params_layout),
+            ],
             immediate_size: 0,
         });
         let pipelines = (0..5)
@@ -344,7 +476,8 @@ impl CanvasRenderer {
                             array_stride: std::mem::size_of::<Vertex>() as u64,
                             step_mode: wgpu::VertexStepMode::Vertex,
                             attributes: &wgpu::vertex_attr_array![
-                                0 => Float32x2, 1 => Float32x4, 2 => Float32x2, 3 => Uint32
+                                0 => Float32x2, 1 => Float32x4, 2 => Float32x2, 3 => Uint32,
+                                4 => Uint32
                             ],
                         })],
                     },
@@ -379,6 +512,9 @@ impl CanvasRenderer {
             ramp_tex,
             ramp_bg,
             ramp_version: 0,
+            params_tex,
+            params_bg,
+            params_version: 0,
             img_layout,
             img_sampler,
             blank_img,
@@ -409,6 +545,33 @@ impl CanvasRenderer {
             self.msaa = Some((tex.create_view(&Default::default()), size));
         }
         &self.msaa.as_ref().unwrap().0
+    }
+
+    fn sync_params(&mut self, queue: &wgpu::Queue) {
+        let a = tess::params().lock().unwrap();
+        if a.version == self.params_version {
+            return;
+        }
+        self.params_version = a.version;
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.params_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytemuck::cast_slice(&a.texels),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(tess::PARAMS_W * 16),
+                rows_per_image: Some(tess::PARAMS_H),
+            },
+            wgpu::Extent3d {
+                width: tess::PARAMS_W,
+                height: tess::PARAMS_H,
+                depth_or_array_layers: 1,
+            },
+        );
     }
 
     fn sync_ramps(&mut self, queue: &wgpu::Queue) {
@@ -467,7 +630,7 @@ impl CanvasRenderer {
 
     /// Rebuild the world vertex/index buffers when the item list changed.
     fn sync_world(&mut self, device: &wgpu::Device, items: &[Item]) {
-        let sig: Vec<(usize, Option<[u64; 4]>, usize)> = items
+        let sig: Vec<WorldKey> = items
             .iter()
             .map(|it| {
                 (
@@ -475,6 +638,7 @@ impl CanvasRenderer {
                     it.clip
                         .map(|c| [c.x.to_bits(), c.y.to_bits(), c.w.to_bits(), c.h.to_bits()]),
                     blend_key(it.blend),
+                    it.round_clip,
                 )
             })
             .collect();
@@ -490,7 +654,10 @@ impl CanvasRenderer {
             for p in it.pieces.iter() {
                 let base = vertices.len() as u32;
                 let start = indices.len() as u32;
-                vertices.extend_from_slice(&p.mesh.vertices);
+                vertices.extend(p.mesh.vertices.iter().map(|v| Vertex {
+                    clip: it.round_clip,
+                    ..*v
+                }));
                 indices.extend(p.mesh.indices.iter().map(|i| i + base));
                 let end = indices.len() as u32;
                 match draws.last_mut() {
@@ -565,6 +732,7 @@ impl CanvasRenderer {
         queue.write_buffer(&self.world_globals, 0, bytemuck::bytes_of(&world));
         queue.write_buffer(&self.screen_globals, 0, bytemuck::bytes_of(&screen));
         self.sync_ramps(queue);
+        self.sync_params(queue);
         for it in &frame.items {
             for p in it.pieces.iter() {
                 if let Some(id) = &p.image {
@@ -663,6 +831,7 @@ impl CanvasRenderer {
             multiview_mask: None,
         });
         pass.set_bind_group(1, &self.ramp_bg, &[]);
+        pass.set_bind_group(3, &self.params_bg, &[]);
         let mut current_pipeline = usize::MAX;
         for d in under.iter().chain(&world_draws).chain(&over) {
             let (vb, ib) = if d.world {

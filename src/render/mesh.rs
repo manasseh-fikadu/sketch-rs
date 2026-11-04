@@ -17,9 +17,10 @@ pub struct Vertex {
     pub color: [f32; 4],
     /// Paint coordinates: gradient space or image texture coordinates.
     pub uv: [f32; 2],
-    /// Paint kind in the low byte (see `PAINT_*`), gradient atlas row above it.
+    /// Paint kind in the low byte (see `PAINT_*`), gradient or param atlas row above it.
     pub kind: u32,
-    pub _pad: u32,
+    /// Param atlas row of a rounded clip (0 = none). Set when the world buffers are built.
+    pub clip: u32,
 }
 
 pub const PAINT_SOLID: u32 = 0;
@@ -27,6 +28,7 @@ pub const PAINT_LINEAR: u32 = 1;
 pub const PAINT_RADIAL: u32 = 2;
 pub const PAINT_IMAGE: u32 = 3;
 pub const PAINT_IMAGE_TILE: u32 = 4;
+pub const PAINT_SHADOW: u32 = 5;
 
 impl Vertex {
     pub fn solid(pos: [f32; 2], color: [f32; 4]) -> Vertex {
@@ -35,7 +37,7 @@ impl Vertex {
             color,
             uv: [0.0; 2],
             kind: PAINT_SOLID,
-            _pad: 0,
+            clip: 0,
         }
     }
 }

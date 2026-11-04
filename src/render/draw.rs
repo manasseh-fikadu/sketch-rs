@@ -7,8 +7,8 @@ use crate::assets;
 use crate::geom::{Rect, V2, v2};
 use crate::ink;
 use crate::model::{
-    BlendMode, Cap, Color, Document, FillRule, ImageMode, Join, Node, NodeId, NodeKind, Paint,
-    Stop, StrokeAlign,
+    BlendMode, BorderSide, Cap, Color, CssAngle, Document, FillRule, ImageMode, Join, Node, NodeId,
+    NodeKind, Paint, Stop, StrokeAlign,
 };
 use crate::text::{self, FaceId};
 use crate::vector::{self, VPath};
@@ -40,6 +40,33 @@ pub enum PaintSpec {
     },
 }
 
+/// A blurred box shadow, in world coordinates.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShadowOp {
+    /// The box casting the shadow, after offset and spread.
+    pub shape: Rect,
+    pub shape_radii: [f64; 4],
+    /// Gaussian standard deviation; CSS defines it as half the blur radius.
+    pub sigma: f64,
+    /// Straight alpha, opacity already applied.
+    pub color: [f32; 4],
+    /// The node's own box. An outer shadow paints only outside it, an inset one only inside.
+    pub box_rect: Rect,
+    pub box_radii: [f64; 4],
+    pub inset: bool,
+}
+
+impl ShadowOp {
+    /// Three standard deviations hold everything visible of a Gaussian.
+    pub fn bounds(&self) -> Rect {
+        if self.inset {
+            self.box_rect
+        } else {
+            self.shape.inflate(3.0 * self.sigma + 1.0)
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum DrawOp {
     Fill {
@@ -62,6 +89,7 @@ pub enum DrawOp {
         color: [f32; 4],
         glyphs: Vec<(u16, V2)>,
     },
+    Shadow(ShadowOp),
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -170,16 +198,48 @@ pub fn image_place(mode: ImageMode, wr: Rect, iw: f64, ih: f64) -> Rect {
     }
 }
 
+/// The CSS gradient line of a box: through its center, and long enough that the corners get
+/// exactly the end colors. Unlike unit-box endpoints, the angle survives non-square boxes.
+pub fn css_gradient_line(a: CssAngle, r: Rect) -> (V2, V2) {
+    let dir = match a {
+        CssAngle::Deg(d) => {
+            let t = d.to_radians();
+            v2(t.sin(), -t.cos())
+        }
+        // "Magic corners": the 50% line runs through the two other corners.
+        CssAngle::To(x, y) if x != 0 && y != 0 => {
+            let d = v2(x as f64 * r.h, y as f64 * r.w);
+            let l = d.dot(d).sqrt().max(1e-9);
+            v2(d.x / l, d.y / l)
+        }
+        CssAngle::To(x, y) => v2(x as f64, y as f64),
+    };
+    let half = ((r.w * dir.x).abs() + (r.h * dir.y).abs()) * 0.5;
+    let c = r.center();
+    (c - dir * half, c + dir * half)
+}
+
 pub fn paint_spec(p: &Paint, wr: Rect, opacity: f64) -> Option<PaintSpec> {
     let at = |u: V2| v2(wr.x + u.x * wr.w, wr.y + u.y * wr.h);
     Some(match p {
         Paint::Solid { color } => PaintSpec::Solid(rgba(*color, opacity)),
-        Paint::Linear { stops, from, to, .. } => PaintSpec::Linear {
-            p0: at(*from),
-            p1: at(*to),
-            stops: sorted(stops),
-            opacity: opacity as f32,
-        },
+        Paint::Linear {
+            stops,
+            from,
+            to,
+            css,
+        } => {
+            let (p0, p1) = match css {
+                Some(a) => css_gradient_line(*a, wr),
+                None => (at(*from), at(*to)),
+            };
+            PaintSpec::Linear {
+                p0,
+                p1,
+                stops: sorted(stops),
+                opacity: opacity as f32,
+            }
+        }
         Paint::Radial {
             stops,
             center,
@@ -221,6 +281,85 @@ fn sorted(stops: &[Stop]) -> Vec<Stop> {
     let mut s = stops.to_vec();
     s.sort_by(|a, b| a.pos.total_cmp(&b.pos));
     s
+}
+
+/// Corner radii of a shape that can cast a box shadow (None for everything else).
+fn box_radii(n: &Node, wr: Rect) -> Option<[f64; 4]> {
+    match n.kind {
+        NodeKind::Frame { .. } | NodeKind::Rect => Some(n.style.corner_radii()),
+        NodeKind::Ellipse => Some([wr.w.min(wr.h) * 0.5; 4]),
+        _ => None,
+    }
+}
+
+/// The node's box shadows of one kind. CSS paints the first one on top, so they go in reverse.
+fn shadow_ops(n: &Node, wr: Rect, opacity: f64, inset: bool, ops: &mut Vec<DrawOp>) {
+    let Some(radii) = box_radii(n, wr) else {
+        return;
+    };
+    for s in n.style.shadows.iter().rev().filter(|s| s.inset == inset) {
+        // A spread grows the box and its rounded corners; an inset spread shrinks them.
+        let spread = if inset { -s.spread } else { s.spread };
+        let shape = wr.translate(v2(s.x, s.y)).inflate(spread);
+        if shape.w <= 0.0 || shape.h <= 0.0 {
+            continue;
+        }
+        ops.push(DrawOp::Shadow(ShadowOp {
+            shape,
+            shape_radii: radii.map(|r| if r > 0.0 { (r + spread).max(0.0) } else { 0.0 }),
+            sigma: (s.blur * 0.5).max(0.25),
+            color: rgba(s.color, opacity),
+            box_rect: wr,
+            box_radii: radii,
+            inset,
+        }));
+    }
+}
+
+/// A border whose sides differ. Square corners get a mitred trapezoid per side, so each side can
+/// have its own color. Rounded corners get one ring between the outer and inner edges.
+fn border_ops(n: &Node, sides: &[BorderSide; 4], wr: Rect, opacity: f64, ops: &mut Vec<DrawOp>) {
+    let [t, r, b, l] = sides.map(|s| s.width.max(0.0));
+    let color = |s: &BorderSide| s.color.or(n.style.stroke);
+    let inner = Rect::new(
+        wr.x + l,
+        wr.y + t,
+        (wr.w - l - r).max(0.0),
+        (wr.h - t - b).max(0.0),
+    );
+    let radii = box_radii(n, wr).unwrap_or([0.0; 4]);
+    if radii.iter().all(|x| *x <= 0.0) {
+        let (x0, y0, x1, y1) = (wr.x, wr.y, wr.right(), wr.bottom());
+        let (ix0, iy0, ix1, iy1) = (inner.x, inner.y, inner.right(), inner.bottom());
+        let polys = [
+            [v2(x0, y0), v2(x1, y0), v2(ix1, iy0), v2(ix0, iy0)],
+            [v2(x1, y0), v2(x1, y1), v2(ix1, iy1), v2(ix1, iy0)],
+            [v2(x1, y1), v2(x0, y1), v2(ix0, iy1), v2(ix1, iy1)],
+            [v2(x0, y1), v2(x0, y0), v2(ix0, iy0), v2(ix0, iy1)],
+        ];
+        for (side, poly) in sides.iter().zip(polys) {
+            if let (true, Some(c)) = (side.width > 0.0, color(side)) {
+                ops.push(DrawOp::Fill {
+                    path: VPath::polyline(poly.as_slice(), true),
+                    paint: PaintSpec::Solid(rgba(c, opacity)),
+                    even_odd: false,
+                });
+            }
+        }
+        return;
+    }
+    let Some(c) = sides.iter().filter(|s| s.width > 0.0).find_map(color) else {
+        return;
+    };
+    let shrink = [t.max(l), t.max(r), b.max(r), b.max(l)];
+    let inner_radii = [0, 1, 2, 3].map(|i| (radii[i] - shrink[i]).max(0.0));
+    let mut path = vector::rounded_rect(wr, radii);
+    path.append(&vector::rounded_rect(inner, inner_radii));
+    ops.push(DrawOp::Fill {
+        path,
+        paint: PaintSpec::Solid(rgba(c, opacity)),
+        even_odd: true,
+    });
 }
 
 /// Draw ops for one node (not its children), in world space.
@@ -312,6 +451,7 @@ pub fn node_draw(n: &Node, wr: Rect, opacity: f64) -> NodeDraw {
                     ..
                 }
             );
+            shadow_ops(n, wr, opacity, false, &mut ops);
             if is_area(n) {
                 for p in &n.style.fills {
                     if let Some(paint) = paint_spec(p, wr, opacity) {
@@ -323,7 +463,10 @@ pub fn node_draw(n: &Node, wr: Rect, opacity: f64) -> NodeDraw {
                     }
                 }
             }
-            if let Some(c) = n.style.stroke
+            shadow_ops(n, wr, opacity, true, &mut ops);
+            if let Some(sides) = &n.style.borders {
+                border_ops(n, sides, wr, opacity, &mut ops);
+            } else if let Some(c) = n.style.stroke
                 && n.style.stroke_width > 0.0
                 && let Some(sp) = stroke_path(n, wr)
             {
@@ -481,5 +624,41 @@ pub fn draw_bounds(n: &Node, wr: Rect) -> Rect {
     if matches!(n.kind, NodeKind::Sticky { .. }) {
         pad = pad.max(4.0);
     }
-    wr.inflate(pad)
+    let mut out = wr.inflate(pad);
+    for s in n.style.shadows.iter().filter(|s| !s.inset) {
+        let reach = s.spread + 1.5 * s.blur + 1.0;
+        out = out.union(&wr.translate(v2(s.x, s.y)).inflate(reach));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn close(a: V2, x: f64, y: f64) -> bool {
+        (a.x - x).abs() < 1e-6 && (a.y - y).abs() < 1e-6
+    }
+
+    #[test]
+    fn css_gradient_lines_use_the_real_box() {
+        let r = Rect::new(0.0, 0.0, 400.0, 100.0);
+        // Straight down: top edge to bottom edge, whatever the width.
+        let (a, b) = css_gradient_line(CssAngle::Deg(180.0), r);
+        assert!(
+            close(a, 200.0, 0.0) && close(b, 200.0, 100.0),
+            "{a:?} {b:?}"
+        );
+        // 45deg keeps its true angle on a wide box, and reaches past it to the corners.
+        let (a, b) = css_gradient_line(CssAngle::Deg(45.0), r);
+        let (dx, dy) = (b.x - a.x, b.y - a.y);
+        assert!((dx + dy).abs() < 1e-6, "45° up and to the right: {dx} {dy}");
+        let half = (400.0 + 100.0) * 45f64.to_radians().sin() * 0.5;
+        assert!((dx.hypot(dy) * 0.5 - half).abs() < 1e-6);
+        // Corner keywords: the 50% line runs through the other two corners.
+        let (a, b) = css_gradient_line(CssAngle::To(1, 1), r);
+        let d = v2(b.x - a.x, b.y - a.y);
+        let across = v2(400.0, -100.0);
+        assert!(d.dot(across).abs() < 1e-6, "perpendicular to that diagonal");
+    }
 }
