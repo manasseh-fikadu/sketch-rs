@@ -463,6 +463,7 @@ pub fn overlay(mb: &mut MeshBuilder, ed: &Editor, offset: V2) {
     }
     vector_edit_overlay(mb, ed, &v, accent);
     whiteboard_overlay(mb, ed, &v, accent);
+    prototype_overlay(mb, ed, &v, accent);
     mb.set_clip(None);
 }
 
@@ -512,6 +513,106 @@ fn whiteboard_overlay(mb: &mut MeshBuilder, ed: &Editor, v: &View, accent: [f32;
         mb.circle(v.to_screen(head), 3.5, [1.0, 0.6, 0.6, 1.0]);
     } else if let Some((p, _)) = trail.first() {
         mb.circle(v.to_screen(*p), 3.0, [0.98, 0.18, 0.2, 1.0]);
+    }
+}
+
+/// A small label on the canvas, starting at `at` (left, vertical center).
+fn pill(mb: &mut MeshBuilder, label: &str, at: V2, color: [f32; 4]) {
+    let w = text::layout(label, 11.0, None, TextAlign::Left).width;
+    let r = Rect::new(at.x, at.y - 9.0, w + 12.0, 18.0);
+    mb.fill_path(
+        &MeshBuilder::rounded_rect_path(r, 9.0),
+        color,
+        FillRule::NonZero,
+    );
+    draw_text(
+        mb,
+        label,
+        11.0,
+        None,
+        TextAlign::Left,
+        v2(r.x + 6.0, r.y + 2.0),
+        1.0,
+        [1.0; 4],
+    );
+}
+
+/// With the Prototype panel open: where layers link to, and the knob for making a new link.
+/// Links to other pages can't be drawn across the canvas, so they get a label on their layer.
+fn prototype_overlay(mb: &mut MeshBuilder, ed: &Editor, v: &View, accent: [f32; 4]) {
+    use crate::editor::prototype::{link_curve, link_end};
+    use crate::model::ProtoAction;
+    if !ed.proto_mode {
+        return;
+    }
+    let page = ed.active_page_id();
+    let linked = ed
+        .doc
+        .nodes
+        .values()
+        .filter(|n| !n.interactions().is_empty() && ed.doc.is_effectively_visible(n.id));
+    for n in linked {
+        let Some(wr) = ed.doc.world_rect(n.id) else {
+            continue;
+        };
+        let r = v.rect_to_screen(&wr);
+        let selected = ed.selection.contains(&n.id);
+        let color = if selected {
+            accent
+        } else {
+            [accent[0], accent[1], accent[2], 0.45]
+        };
+        let from = v2(r.right(), r.center().y);
+        mb.circle(from, 3.5, color);
+        let mut tag_y = from.y;
+        for it in n.interactions() {
+            let label = match &it.action {
+                ProtoAction::Navigate { target, .. } | ProtoAction::OpenOverlay { target, .. } => {
+                    match ed.resolve_target(page, target) {
+                        Some(t) if t.page == page => {
+                            if let Some(tr) = ed.doc.world_rect(t.node) {
+                                let to = link_end(v.rect_to_screen(&tr));
+                                let line = link_curve(from, to);
+                                mb.stroke_path(
+                                    &MeshBuilder::polygon_path(&line, false),
+                                    if selected { 2.0 } else { 1.25 },
+                                    color,
+                                    LineCap::Round,
+                                );
+                                mb.circle(to, 3.5, color);
+                            }
+                            None
+                        }
+                        Some(t) => Some(format!("→ {}", ed.pages[t.page_index].name)),
+                        None => Some("Target missing".to_string()),
+                    }
+                }
+                ProtoAction::Back => Some("← Back".to_string()),
+                ProtoAction::CloseOverlay => Some("Close overlay".to_string()),
+                ProtoAction::OpenUrl { url } => {
+                    Some(format!("↗ {}", url.chars().take(32).collect::<String>()))
+                }
+            };
+            if let Some(l) = label.filter(|_| selected) {
+                pill(mb, &l, v2(from.x + 34.0, tag_y), accent);
+                tag_y += 22.0;
+            }
+        }
+    }
+    if let Some(k) = ed.proto_knob() {
+        let k = k + v.offset;
+        if ed.proto_link_source().is_some() {
+            let line = link_curve(k, ed.pointer + v.offset);
+            mb.stroke_path(
+                &MeshBuilder::polygon_path(&line, false),
+                2.0,
+                accent,
+                LineCap::Round,
+            );
+        }
+        mb.circle(k, 8.0, accent);
+        mb.line(k - v2(4.0, 0.0), k + v2(4.0, 0.0), 1.6, [1.0; 4]);
+        mb.line(k - v2(0.0, 4.0), k + v2(0.0, 4.0), 1.6, [1.0; 4]);
     }
 }
 

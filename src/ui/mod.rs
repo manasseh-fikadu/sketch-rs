@@ -7,6 +7,7 @@ pub mod library;
 pub mod pages;
 pub mod palette;
 pub mod preview_bar;
+pub mod prototype;
 
 use crate::editor::shortcuts::{self, Action};
 use crate::editor::{Editor, Tool};

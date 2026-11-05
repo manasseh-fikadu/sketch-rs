@@ -2,7 +2,7 @@
 //! constraints, text, fills, stroke and layer properties. Edits are coalesced per field so a
 //! drag on a number is one undo step, and edits inside instances become overrides.
 
-use super::{UiState, c32, from32, section, title_text};
+use super::{UiState, c32, from32, title_text};
 use crate::editor::vector_ops::BoolOp;
 use crate::editor::{AppRequest, Editor};
 use crate::geom::v2;
@@ -41,7 +41,7 @@ fn seal_on_release(ed: &mut Editor, r: &egui::Response) {
 }
 
 /// A row: secondary label on the left, controls on the right.
-fn row<R>(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui) -> R) -> R {
+pub(super) fn row<R>(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui) -> R) -> R {
     ui.horizontal(|ui| {
         let (r, _) = ui.allocate_exact_size(egui::vec2(LABEL_W, 20.0), egui::Sense::hover());
         ui.painter().text(
@@ -57,7 +57,7 @@ fn row<R>(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui) -> R) -> R {
 }
 
 /// A compact number field with a leading letter (like Figma's "X 120").
-fn num_field(
+pub(super) fn num_field(
     ui: &mut Ui,
     ed: &mut Editor,
     prefix: &str,
@@ -79,14 +79,14 @@ fn num_field(
     (r.changed() && v != value).then_some(v)
 }
 
-fn color_button(ui: &mut Ui, ed: &mut Editor, c: Color) -> Option<Color> {
+pub(super) fn color_button(ui: &mut Ui, ed: &mut Editor, c: Color) -> Option<Color> {
     let mut c2 = c32(c);
     let r = ui.color_edit_button_srgba(&mut c2);
     seal_on_release(ed, &r);
     (r.changed() && from32(c2) != c).then(|| from32(c2))
 }
 
-fn combo<T: PartialEq + Copy>(
+pub(super) fn combo<T: PartialEq + Copy>(
     ui: &mut Ui,
     id: &str,
     current: T,
@@ -109,7 +109,7 @@ fn combo<T: PartialEq + Copy>(
     (v != current).then_some(v)
 }
 
-fn separator(ui: &mut Ui) {
+pub(super) fn separator(ui: &mut Ui) {
     ui.add_space(6.0);
     let r = ui.available_rect_before_wrap();
     ui.painter().hline(
@@ -140,8 +140,12 @@ pub fn panel(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) {
         .auto_shrink(false)
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 5.0;
-            section(ui, "Design");
+            panel_tabs(ui, ed);
             ui.add_space(2.0);
+            if ed.proto_mode {
+                super::prototype::panel(ui, ed);
+                return;
+            }
             let ids = ed.top_selection();
             if ids.is_empty() {
                 nothing_selected(ui, ed);
@@ -199,6 +203,28 @@ pub fn panel(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) {
             separator(ui);
             export_section(ui, ed, st);
         });
+}
+
+/// Switch the right panel between designing and prototyping (⇧E).
+fn panel_tabs(ui: &mut Ui, ed: &mut Editor) {
+    let p = theme::pal(ui);
+    ui.horizontal(|ui| {
+        for (proto, label) in [(false, "Design"), (true, "Prototype")] {
+            let on = ed.proto_mode == proto;
+            let r = ui.add(
+                egui::Label::new(
+                    RichText::new(label)
+                        .font(theme::semibold(theme::SECONDARY))
+                        .color(if on { p.text } else { p.secondary }),
+                )
+                .sense(egui::Sense::click()),
+            );
+            if r.clicked() {
+                ed.proto_mode = proto;
+                ed.revision += 1;
+            }
+        }
+    });
 }
 
 /// FigJam/Excalidraw-style sticky colours.
