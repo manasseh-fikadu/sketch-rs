@@ -9,9 +9,19 @@ use crate::model::{AutoLayout, Direction, InstanceLink, Node, NodeId, NodeKind, 
 use std::collections::{BTreeSet, HashSet};
 
 /// Property groups an instance can override (and that sync copies from the main component).
-pub const OVERRIDE_KEYS: [&str; 11] = [
-    "fills", "stroke", "radius", "opacity", "text", "font", "visible", "name", "size", "position",
+pub const OVERRIDE_KEYS: [&str; 12] = [
+    "fills",
+    "stroke",
+    "radius",
+    "opacity",
+    "text",
+    "font",
+    "visible",
+    "name",
+    "size",
+    "position",
     "layout",
+    "prototype",
 ];
 
 /// Map an inspector field name to the override key it changes.
@@ -29,6 +39,7 @@ pub fn override_key(field: &str) -> &'static str {
         }
         "visible" => "visible",
         "name" => "name",
+        "prototype" => "prototype",
         _ => "layout",
     }
 }
@@ -92,6 +103,9 @@ fn copy_props(main: &Node, inst: &mut Node, overrides: &[String], is_root: bool)
     }
     if !ov("name") && !is_root {
         inst.name = main.name.clone();
+    }
+    if !ov("prototype") {
+        inst.proto = main.proto.clone();
     }
     if !ov("layout") {
         inst.layout = main.layout;

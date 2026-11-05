@@ -2182,6 +2182,15 @@ impl Editor {
             .iter()
             .map(|r| self.doc.world_rect(*r).unwrap_or_default())
             .collect();
+        // Links to layers staying behind name this page, so they still work if pasted elsewhere.
+        let page = self.active_page_id().to_string();
+        let copied: std::collections::HashSet<NodeId> =
+            self.clipboard.iter().map(|n| n.id).collect();
+        for n in &mut self.clipboard {
+            if let Some(p) = &mut n.proto {
+                p.name_page(&page, |id| copied.contains(&id));
+            }
+        }
         self.clipboard_roots = roots;
         self.clipboard_page = Some(self.active_page_id().to_string());
         self.status = format!("Copied {} layer(s)", self.clipboard_roots.len());
@@ -2371,6 +2380,7 @@ pub fn insert_subtrees_tx(
                 None => c.instance = None,
             }
         }
+        c.edit_proto_if_set(|p| p.remap(map, same_page));
     };
     let mut new_roots = Vec::new();
     for (i, r) in roots.iter().enumerate() {

@@ -429,6 +429,9 @@ pub struct Node {
     /// Instance link (instance roots and every node inside an instance).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instance: Option<InstanceLink>,
+    /// What this layer does in the prototype preview.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proto: Option<Box<super::proto::Prototype>>,
 }
 
 /// One anchor of a vector path, with optional bezier handles (node-local, absolute).
@@ -506,6 +509,7 @@ impl Node {
             layout_child: LayoutChild::default(),
             component: false,
             instance: None,
+            proto: None,
         }
     }
 
