@@ -15,7 +15,8 @@ infinite canvas with frames, groups, components and instances, auto layout and c
 vector paths and booleans, gradients and image fills, rich text, smart guides, and
 pressure-sensitive ink, plus a whiteboard mode: hand-drawn (rough.js-style) shapes, arrows that
 bind to shapes and re-route, elbow connectors, sticky notes, a laser pointer and a shape
-library. Everything autosaves, and exports to PNG, SVG and PDF; Excalidraw files and SVG import.
+library. A prototype preview plays frames like a real website. Everything autosaves, and exports
+to PNG, SVG and PDF; Excalidraw files and SVG import.
 
 ![Figma-core features](docs/screenshots/milestone3_figma_core.png)
 
@@ -160,6 +161,7 @@ written for Paper work here too.
 | See | `get_screenshot` (PNG image content of a node or the page), `export` (PNG/SVG/PDF files), `export_combined_pdf` |
 | Write | `create_artboard`, `write_html`, `update_styles`, `set_text_content`, `rename_nodes`, `duplicate_nodes`, `move_nodes`, `delete_nodes`, `finish_working_on_nodes` (saves) |
 | Sketch extras | `create_shape` (rectangles, ellipses, diamonds, stars, stickies, text, lines, arrows bound to shapes), `select_nodes`, `undo`, `redo` |
+| Prototype | `set_interactions`, `get_interactions`, `preview` (start, stop, click, hover, scroll, back, screenshot) |
 
 `write_html` takes HTML with inline styles, and [Taffy](https://github.com/DioxusLabs/taffy) lays
 it out: flexbox, CSS grid, block flow with margin collapsing, percentages, min/max sizes,
@@ -175,6 +177,11 @@ node); `pageId` lets an agent work on another page without switching the user's 
 CSS that has no effect comes back in the result's `ignoredStyles`, so an agent can tell when
 something didn't land. Everything measures as `box-sizing: border-box`, and elements have no
 default margins.
+
+In `write_html`, `<a href>` becomes a link: to a URL, to a page or frame by name, or to `#id` in
+the same HTML. `data-hover` and `data-pressed` take CSS for those states, and `position: fixed` or
+`sticky` and `overflow: auto` or `scroll` carry over to the preview. `get_guide` with the topic
+`prototype` has the details.
 
 ## Tests
 
@@ -194,8 +201,9 @@ cargo test --release --test perf -- --nocapture   # 10k-element frame timings
   `tests/figma.rs` (groups, components, auto layout, constraints, pen, booleans, rich text,
   guides), `tests/excalidraw.rs` (hand-drawn style, arrows, quick-connect, stickies, laser,
   library), `tests/workflow.rs` (layers drag, palette, shortcuts), `tests/io.rs` (export,
-  import, clipboard, CLI), `tests/mcp.rs` (every MCP tool on a headless session, then an rmcp
-  client over HTTP and through the `sketch-rs-mcp` stdio bridge).
+  import, clipboard, CLI), `tests/prototype.rs` (links across pages, scrolling, hover states,
+  overlays, transitions and their MCP tools), `tests/mcp.rs` (every MCP tool on a headless
+  session, then an rmcp client over HTTP and through the `sketch-rs-mcp` stdio bridge).
 * **Fidelity tests** (`tests/fidelity.rs`) send HTML through `write_html` and `get_screenshot`, and
   compare the result with a committed Chromium render. Each page has a budget of differing pixels
   that should only ever go down. Look at the side-by-sides too: a low score can still hide a
@@ -232,6 +240,34 @@ select, Shift-click to add, double-click to rename, and use 👁 / 🔒 to hide 
   smoothing and color in the Design panel.
 * Hold ⌘/Ctrl while dragging to suspend snapping.
 
+### Prototyping
+
+Press ▶ in the toolbar (⌘⌥↩) to play a frame like a website: the wheel scrolls it, layers respond
+to the pointer and links work. It starts on the selected layer's frame, or the frame in the middle
+of the view. The bar on top goes back, restarts, jumps to any screen, outlines what's clickable
+and switches between fitting the window's width and 100%. Esc leaves. The preview works on its own
+copy of each page, so it never changes the design, its undo history or the view you return to.
+
+The **Prototype** tab of the right panel (⇧E) sets up the selected layer:
+
+* **Interactions.** When a layer is clicked, hovered, or after a delay: go to a screen, go back,
+  open or close an overlay, or open a web link. Screens come from every page of the project, so
+  a site split across pages links up as one. A link can also scroll to a section of its screen,
+  or just scroll if that screen is already showing. Transitions are dissolve, slide in and push,
+  and Back plays them in reverse. Drag the knob beside a layer onto a frame on the same page to
+  link to it.
+* **Hover and pressed states.** Fill, text color, border, opacity and a nudge, like `:hover` and
+  `:active`: they apply when the pointer is on the layer or anything inside it. Put them and links
+  on a whole button or card rather than its label.
+* **Scrolling.** Top-level frames scroll when they're taller than the window. A layer can stay
+  fixed, or stick at the top once it reaches it, like `position: sticky`. Give a sticky header a
+  background, or the page shows through it. A frame inside a screen can scroll its own overflow.
+* Hovering a dropdown overlay keeps it open until the pointer leaves both it and the layer that
+  opened it. Layers with no paint of their own, such as empty layout frames, don't block clicks.
+
+With the tab open, the canvas shows where layers link: a line to a target on the same page, and a
+label such as "→ About" for one on another page.
+
 ### Keyboard shortcuts
 
 ⌘ on macOS, Ctrl on Linux and Windows. Press `?` or ⌘/ in the app for the full grouped list
@@ -256,6 +292,7 @@ select, Shift-click to add, double-click to rename, and use 👁 / 🔒 to hide 
 | ⌥ hover | Measure distances | ⌘R | Rename |
 | ⌘= / ⌘- / ⇧0 | Zoom in / out / 100% | ⇧1 / ⇧2 | Zoom to fit / selection |
 | PageUp / PageDown | Previous / next page | ⌘\\ | Show / hide UI |
+| ⌘⌥↩ | Preview prototype | ⇧E | Design / Prototype panel |
 
 ## Feature parity: Paper / Figma / Excalidraw vs Sketch
 
@@ -313,6 +350,11 @@ Known gaps), ⏳ planned in a later milestone, ❌ not planned.
   group. Overlay, color dodge/burn, hard/soft light, difference, exclusion, hue, saturation,
   color and luminosity blend as Normal on the canvas (they are exact in SVG export). Only the
   innermost rounded clipping frame rounds its corners.
+* **Prototype preview.** Layers can't morph between screens (no Smart Animate), and there are no
+  variants, or drag and key triggers. Hover and pressed states switch instantly. Inputs can't be
+  typed into, so forms are for show. A text layer holds one link, so a line with several links
+  needs a layer for each. Dissolve fades layers one by one, so overlapping ones show through
+  each other partway. A sticky layer stays until the end of the page, not of its parent.
 * **Booleans are destructive**: the result is a new vector path with flattened curves.
   Gradients are edited in the inspector only.
 * **macOS hand testing is missing.** On a clean arm64 macOS 26 runner, this fork builds, passes
@@ -358,6 +400,7 @@ src/project/       project store, manifest/page formats, migrations
 src/session.rs     open project, autosave, thumbnails
 src/editor/        tools, structure (groups/components), vector ops, pages, text editing
 src/render/        draw ops → cached meshes → wgpu; headless capture
+src/preview/       prototype preview: screens, scrolling, overlays, transitions
 src/io/            PNG, SVG, PDF, export scopes, Excalidraw + SVG import, clipboard,
                    atomic writes
 src/connector.rs   arrow bindings, elbow router, arrowheads
