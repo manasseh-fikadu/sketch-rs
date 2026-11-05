@@ -15,6 +15,7 @@ pub mod library;
 pub mod macos;
 pub mod mcp;
 pub mod model;
+pub mod preview;
 pub mod project;
 pub mod render;
 pub mod session;

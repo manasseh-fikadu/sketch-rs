@@ -619,6 +619,7 @@ impl App {
                         Err(e) => self.ed.status = e,
                     }
                 }
+                AppRequest::OpenUrl(url) => self.ctx.open_url(egui::OpenUrl::new_tab(url)),
             }
         }
     }
@@ -994,7 +995,15 @@ impl ApplicationHandler<UserEvent> for App {
                         time_ms: now,
                     });
                     redraw = true;
-                } else if self.ed.hover.take().is_some() {
+                } else {
+                    let left = self.ed.preview_pointer_left();
+                    if self.ed.hover.take().is_some() || left {
+                        redraw = true;
+                    }
+                }
+            }
+            WindowEvent::CursorLeft { .. } => {
+                if self.ed.preview_pointer_left() {
                     redraw = true;
                 }
             }

@@ -72,6 +72,8 @@ pub enum Action {
     ExportPdf,
     CopyAsPng,
     CopyAsSvg,
+    TogglePreview,
+    ToggleProtoPanel,
 }
 
 impl Action {
@@ -298,6 +300,13 @@ fn bindings() -> Vec<(Key, Chord, Action, &'static str)> {
         (Char('x'), CMD_SHIFT, A::Strikethrough, "Strikethrough"),
         (Char('k'), CMD_SHIFT, A::PlaceImage, "Place image…"),
         (Char('\''), CMD, A::ToggleSnapping, "Toggle snapping"),
+        (Enter, CMD_ALT, A::TogglePreview, "Preview prototype"),
+        (
+            Char('e'),
+            SHIFT,
+            A::ToggleProtoPanel,
+            "Design / Prototype panel",
+        ),
     ]
 }
 
@@ -422,7 +431,9 @@ pub fn category(a: Action) -> &'static str {
         | A::ToggleUi
         | A::ToggleHelp
         | A::NextPage
-        | A::PrevPage => "View",
+        | A::PrevPage
+        | A::TogglePreview
+        | A::ToggleProtoPanel => "View",
         A::Bold | A::Italic | A::Underline | A::Strikethrough => "Text",
         A::Boolean(_) | A::Flatten | A::ToggleSketch => "Vector & style",
         _ => "Arrange & layout",
@@ -602,6 +613,8 @@ pub fn menus() -> Vec<(&'static str, Vec<MenuEntry>)> {
                 I("Snapping", A::ToggleSnapping),
                 I("Dot Grid", A::ToggleGrid),
                 I("Show/Hide UI", A::ToggleUi),
+                I("Preview Prototype", A::TogglePreview),
+                I("Prototype Panel", A::ToggleProtoPanel),
                 I("Keyboard Shortcuts", A::ToggleHelp),
             ],
         ),

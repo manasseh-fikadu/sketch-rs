@@ -9,6 +9,8 @@ use crate::ui::{self, UiState};
 pub struct Painter {
     pub canvas: CanvasRenderer,
     pub cache: scene::SceneCache,
+    /// The prototype preview's own geometry; empty unless it's running.
+    pub preview_cache: crate::preview::render::PreviewCache,
     egui: egui_wgpu::Renderer,
     /// Clear to transparent so a vibrancy view behind the window shows through wherever the
     /// UI doesn't paint (the canvas always paints its own opaque background).
@@ -41,6 +43,7 @@ pub fn layout(
         ed.pending_fit = false;
         ed.zoom_to_fit();
     }
+    ed.preview_sync();
     Layout { output, canvas }
 }
 
@@ -49,6 +52,7 @@ impl Painter {
         Painter {
             canvas: CanvasRenderer::new(device, format),
             cache: scene::SceneCache::default(),
+            preview_cache: Default::default(),
             egui: egui_wgpu::Renderer::new(device, format, egui_wgpu::RendererOptions::default()),
             transparent: false,
         }
@@ -69,7 +73,13 @@ impl Painter {
     ) {
         let ppp = layout.output.pixels_per_point;
         let offset = v2(layout.canvas.min.x as f64, layout.canvas.min.y as f64);
-        let frame = scene::canvas(ed, &mut self.cache, offset, show_grid);
+        let frame = match &ed.preview {
+            Some(p) => crate::preview::render::frame(p, &mut self.preview_cache, offset),
+            None => {
+                self.preview_cache.clear();
+                scene::canvas(ed, &mut self.cache, offset, show_grid)
+            }
+        };
         let mut enc = device.create_command_encoder(&Default::default());
         let bg = if self.transparent {
             [0.0; 4]

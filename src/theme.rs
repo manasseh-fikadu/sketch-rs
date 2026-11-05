@@ -337,6 +337,9 @@ pub enum Icon {
     Laser,
     Library,
     Sketch,
+    Play,
+    Close,
+    ChevronLeft,
 }
 
 pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
@@ -467,6 +470,16 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color3
         }
         Icon::ChevronRight => {
             line(&[pt(6.0, 3.5), pt(10.5, 8.0), pt(6.0, 12.5)]);
+        }
+        Icon::ChevronLeft => {
+            line(&[pt(10.0, 3.5), pt(5.5, 8.0), pt(10.0, 12.5)]);
+        }
+        Icon::Play => {
+            closed(&[pt(5.0, 3.0), pt(13.0, 8.0), pt(5.0, 13.0)]);
+        }
+        Icon::Close => {
+            line(&[pt(4.0, 4.0), pt(12.0, 12.0)]);
+            line(&[pt(12.0, 4.0), pt(4.0, 12.0)]);
         }
         Icon::ChevronDown => {
             line(&[pt(3.5, 6.0), pt(8.0, 10.5), pt(12.5, 6.0)]);

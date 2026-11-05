@@ -6,6 +6,7 @@ pub mod inspector;
 pub mod library;
 pub mod pages;
 pub mod palette;
+pub mod preview_bar;
 
 use crate::editor::shortcuts::{self, Action};
 use crate::editor::{Editor, Tool};
@@ -102,6 +103,9 @@ pub fn draw(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) -> egui::Rect {
             UiEvent::ToggleHelp => st.show_help = !st.show_help,
             UiEvent::ToggleGrid => st.show_grid_off = !st.show_grid_off,
         }
+    }
+    if ed.preview.is_some() {
+        return preview_bar::draw(ui, ed, st);
     }
     if st.hide_ui {
         let canvas = ui.available_rect_before_wrap();
@@ -232,6 +236,15 @@ fn top_bar(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) {
                 .clicked()
             {
                 st.show_help = !st.show_help;
+            }
+            if theme::icon_button(ui, theme::Icon::Play, 26.0, false)
+                .on_hover_text(format!(
+                    "Preview prototype ({})",
+                    shortcuts::chord_text(Action::TogglePreview)
+                ))
+                .clicked()
+            {
+                ed.run(Action::TogglePreview);
             }
             ui.add_space(8.0);
             if theme::icon_button(ui, theme::Icon::Plus, 26.0, false)

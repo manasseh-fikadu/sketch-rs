@@ -6,6 +6,7 @@ pub mod commands;
 pub mod hit;
 pub mod input;
 pub mod pages;
+pub mod prototype;
 pub mod shortcuts;
 pub mod snap;
 pub mod structure;
@@ -123,6 +124,8 @@ pub enum AppRequest {
     PlaceImage,
     /// Pick an image for fill layer `.1` of these layers.
     ImageFill(Vec<NodeId>, usize),
+    /// A prototype link leaving the app. Already checked by `preview::is_safe_url`.
+    OpenUrl(String),
 }
 
 #[derive(Debug, Clone)]
@@ -197,6 +200,10 @@ enum Gesture {
         si: usize,
         pi: usize,
         part: vector_ops::PointPart,
+    },
+    /// Dragging out a prototype link from this layer's knob.
+    ProtoLink {
+        from: NodeId,
     },
 }
 
@@ -275,6 +282,10 @@ pub struct Editor {
     /// Text we last put on the system clipboard (to recognize our own copy).
     clipboard_written: Option<String>,
     clipboard_style: Option<(crate::model::Style, crate::model::TextStyle)>,
+    /// The prototype preview, while it's running. All input goes to it instead of the editor.
+    pub preview: Option<Box<crate::preview::Preview>>,
+    /// The Prototype panel is open: links show on the canvas and can be dragged out.
+    pub proto_mode: bool,
 }
 
 impl Default for Editor {
@@ -338,6 +349,8 @@ impl Editor {
             clipboard_style: None,
             clipboard_io: None,
             clipboard_written: None,
+            preview: None,
+            proto_mode: false,
         }
     }
 
@@ -457,6 +470,7 @@ impl Editor {
             sticky_color: self.sticky_color,
             clipboard_io: self.clipboard_io.take(),
             clipboard_written: self.clipboard_written.take(),
+            proto_mode: self.proto_mode,
             ..Editor::new(doc)
         };
         self.file_path = path;
@@ -601,6 +615,10 @@ impl Editor {
     // ------------------------------------------------------------------ input
 
     pub fn handle(&mut self, ev: InputEvent) {
+        if self.preview.is_some() {
+            self.preview_input(ev);
+            return;
+        }
         match ev {
             InputEvent::Modifiers(m) => {
                 self.mods = m;
@@ -823,6 +841,9 @@ impl Editor {
     }
 
     fn select_down(&mut self, pos: V2, world: V2, double: bool) {
+        if self.proto_knob_down(pos) {
+            return;
+        }
         if self.path_edit.is_none() && self.text_edit.is_none() {
             if let Some(&(dir, _)) = self.quick_knobs().iter().find(|(_, p)| p.dist(pos) <= 9.0) {
                 self.quick_connect(dir);
@@ -1350,6 +1371,10 @@ impl Editor {
                 self.drag_path_part(si, pi, part, w);
                 self.gesture = Gesture::PathPart { si, pi, part };
             }
+            Gesture::ProtoLink { from } => {
+                self.proto_link_drag(from, world);
+                self.gesture = Gesture::ProtoLink { from };
+            }
         }
     }
 
@@ -1519,6 +1544,7 @@ impl Editor {
                 }
             }
             Gesture::PathPart { .. } => self.commit(),
+            Gesture::ProtoLink { from } => self.proto_link_up(from, world),
         }
     }
 
@@ -1799,6 +1825,14 @@ impl Editor {
 
     pub fn run(&mut self, action: shortcuts::Action) {
         use shortcuts::Action as A;
+        if self.preview.is_some() {
+            match action {
+                A::TogglePreview | A::ToggleUi | A::Save => {}
+                // Leaving the project ends the preview; editing commands just don't apply.
+                A::New | A::Open | A::SaveAs | A::Home => self.stop_preview(),
+                _ => return,
+            }
+        }
         match action {
             A::Tool(t) => {
                 self.end_text_edit();
@@ -1997,6 +2031,17 @@ impl Editor {
             A::CopyProps => self.copy_props(),
             A::PasteProps => self.paste_props(),
             A::Home => self.requests.push(AppRequest::Home),
+            A::TogglePreview => {
+                if self.preview.is_some() {
+                    self.stop_preview();
+                } else {
+                    self.start_preview(None);
+                }
+            }
+            A::ToggleProtoPanel => {
+                self.proto_mode = !self.proto_mode;
+                self.revision += 1;
+            }
         }
     }
 

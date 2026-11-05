@@ -469,12 +469,14 @@ impl Editor {
         self.laser
             .last()
             .is_some_and(|(_, t)| now - t < LASER_DECAY_MS)
+            || self.preview.as_ref().is_some_and(|p| p.animating(now))
     }
 
     /// Drop faded laser points (call with the current time before drawing).
     pub fn tick(&mut self, now: f64) {
         self.now_ms = now;
         self.laser.retain(|(_, t)| now - t < LASER_DECAY_MS);
+        self.with_preview(|p, ed| p.tick(ed, now));
     }
 
     // ---------------------------------------------------------------------- sketch style
