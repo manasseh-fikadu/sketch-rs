@@ -22,6 +22,8 @@ struct Globals {
     zoom: f32,
     pan: vec2<f32>,
     offset: vec2<f32>,
+    alpha: f32,
+    pad: f32,
 };
 @group(0) @binding(0) var<uniform> g: Globals;
 @group(1) @binding(0) var ramp_tex: texture_2d<f32>;
@@ -156,6 +158,7 @@ fn fs(i: VsOut) -> @location(0) vec4<f32> {
         let d = sd_rrect(i.world, param(i.clip, 0), param(i.clip, 1));
         c.a *= clamp(0.5 - d * g.zoom * g.scale, 0.0, 1.0);
     }
+    c.a *= g.alpha;
     // Premultiplied output; every pipeline blends premultiplied.
     return vec4<f32>(c.rgb * c.a, c.a);
 }
@@ -169,6 +172,9 @@ struct Globals {
     zoom: f32,
     pan: [f32; 2],
     offset: [f32; 2],
+    /// Multiplies everything drawn: a whole layer fading in or out.
+    alpha: f32,
+    pad: f32,
 }
 
 /// GPU pipelines exist for the blend modes fixed-function blending can express.
@@ -215,11 +221,17 @@ fn blend_state(key: usize) -> wgpu::BlendState {
     wgpu::BlendState { color, alpha }
 }
 
-/// (buffer identity, clip rect, blend key, rounded clip row) of one item, to spot changes.
-type WorldKey = (usize, Option<[u64; 4]>, usize, u32);
+/// (buffer identity, clip rect, blend key, rounded clip row, layer) of one item, to spot changes.
+type WorldKey = (usize, Option<[u64; 4]>, usize, u32, u16);
 
-/// (index range, world clip, blend key, image) of one cached world draw.
-type WorldDraw = (std::ops::Range<u32>, Option<Rect>, usize, Option<String>);
+/// (index range, world clip, blend key, image, layer) of one cached world draw.
+type WorldDraw = (
+    std::ops::Range<u32>,
+    Option<Rect>,
+    usize,
+    Option<String>,
+    u16,
+);
 
 struct Draw {
     range: std::ops::Range<u32>,
@@ -227,7 +239,8 @@ struct Draw {
     clip: Option<Rect>,
     blend: usize,
     image: Option<String>,
-    world: bool,
+    /// The render layer of a world draw; `None` draws in screen space.
+    layer: Option<u16>,
 }
 
 /// Cached world-space geometry: reused while the item list is unchanged (panning, idle).
@@ -235,15 +248,16 @@ struct WorldBuffers {
     signature: Vec<WorldKey>,
     vb: Option<wgpu::Buffer>,
     ib: Option<wgpu::Buffer>,
-    /// (index range, world clip, blend key, image) per draw.
+    /// (index range, world clip, blend key, image, layer) per draw.
     draws: Vec<WorldDraw>,
 }
 
 pub struct CanvasRenderer {
     pipelines: Vec<wgpu::RenderPipeline>,
-    world_globals: wgpu::Buffer,
+    globals_layout: wgpu::BindGroupLayout,
+    /// One uniform buffer and bind group per render layer; layer 0 is the plain world view.
+    world_globals: Vec<(wgpu::Buffer, wgpu::BindGroup)>,
     screen_globals: wgpu::Buffer,
-    world_bg: wgpu::BindGroup,
     screen_bg: wgpu::BindGroup,
     ramp_tex: wgpu::Texture,
     ramp_bg: wgpu::BindGroup,
@@ -276,6 +290,21 @@ fn texture_2d(device: &wgpu::Device, label: &str, w: u32, h: u32, mips: u32) -> 
         format: wgpu::TextureFormat::Rgba8Unorm,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
+    })
+}
+
+fn globals_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    buffer: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("globals"),
+        layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: buffer.as_entire_binding(),
+        }],
     })
 }
 
@@ -353,20 +382,8 @@ impl CanvasRenderer {
                 mapped_at_creation: false,
             })
         };
-        let world_globals = mk_globals("world globals");
         let screen_globals = mk_globals("screen globals");
-        let mk_bg = |buf: &wgpu::Buffer| {
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("globals"),
-                layout: &globals_layout,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: buf.as_entire_binding(),
-                }],
-            })
-        };
-        let world_bg = mk_bg(&world_globals);
-        let screen_bg = mk_bg(&screen_globals);
+        let screen_bg = globals_bind_group(device, &globals_layout, &screen_globals);
         let ramp_tex = texture_2d(device, "gradient ramps", tess::ATLAS_W, tess::ATLAS_H, 1);
         let ramp_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("ramp"),
@@ -505,9 +522,9 @@ impl CanvasRenderer {
             .collect();
         CanvasRenderer {
             pipelines,
-            world_globals,
+            globals_layout,
+            world_globals: Vec::new(),
             screen_globals,
-            world_bg,
             screen_bg,
             ramp_tex,
             ramp_bg,
@@ -639,6 +656,7 @@ impl CanvasRenderer {
                         .map(|c| [c.x.to_bits(), c.y.to_bits(), c.w.to_bits(), c.h.to_bits()]),
                     blend_key(it.blend),
                     it.round_clip,
+                    it.layer,
                 )
             })
             .collect();
@@ -662,11 +680,15 @@ impl CanvasRenderer {
                 let end = indices.len() as u32;
                 match draws.last_mut() {
                     Some(d)
-                        if d.1 == it.clip && d.2 == bk && d.3 == p.image && d.0.end == start =>
+                        if d.1 == it.clip
+                            && d.2 == bk
+                            && d.3 == p.image
+                            && d.4 == it.layer
+                            && d.0.end == start =>
                     {
                         d.0.end = end
                     }
-                    _ => draws.push((start..end, it.clip, bk, p.image.clone())),
+                    _ => draws.push((start..end, it.clip, bk, p.image.clone(), it.layer)),
                 }
             }
         }
@@ -715,22 +737,44 @@ impl CanvasRenderer {
         frame: &CanvasFrame,
         clear: [f64; 4],
     ) {
-        let cam = frame.camera;
-        let world = Globals {
+        let base = Globals {
             size_px: [size[0] as f32, size[1] as f32],
             scale,
-            zoom: cam.zoom as f32,
-            pan: [cam.pan.x as f32, cam.pan.y as f32],
-            offset: [frame.offset.x as f32, frame.offset.y as f32],
-        };
-        let screen = Globals {
             zoom: 1.0,
             pan: [0.0; 2],
             offset: [0.0; 2],
-            ..world
+            alpha: 1.0,
+            pad: 0.0,
         };
-        queue.write_buffer(&self.world_globals, 0, bytemuck::bytes_of(&world));
-        queue.write_buffer(&self.screen_globals, 0, bytemuck::bytes_of(&screen));
+        queue.write_buffer(&self.screen_globals, 0, bytemuck::bytes_of(&base));
+        let layer_count = frame
+            .items
+            .iter()
+            .map(|it| it.layer as usize + 1)
+            .max()
+            .unwrap_or(1)
+            .max(frame.layers.len());
+        while self.world_globals.len() < layer_count {
+            let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("world globals"),
+                size: std::mem::size_of::<Globals>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let bg = globals_bind_group(device, &self.globals_layout, &buffer);
+            self.world_globals.push((buffer, bg));
+        }
+        for i in 0..layer_count {
+            let l = frame.layer(i);
+            let world = Globals {
+                zoom: l.camera.zoom as f32,
+                pan: [l.camera.pan.x as f32, l.camera.pan.y as f32],
+                offset: [frame.offset.x as f32, frame.offset.y as f32],
+                alpha: l.opacity as f32,
+                ..base
+            };
+            queue.write_buffer(&self.world_globals[i].0, 0, bytemuck::bytes_of(&world));
+        }
         self.sync_ramps(queue);
         self.sync_params(queue);
         for it in &frame.items {
@@ -758,7 +802,7 @@ impl CanvasRenderer {
                     clip: b.clip,
                     blend: 0,
                     image: None,
-                    world: false,
+                    layer: None,
                 });
             }
         }
@@ -776,32 +820,30 @@ impl CanvasRenderer {
                 }),
             )
         });
-        let vp = frame.viewport;
-        let to_screen = |r: &Rect| {
-            Rect::new(
-                (r.x - cam.pan.x) * cam.zoom + frame.offset.x,
-                (r.y - cam.pan.y) * cam.zoom + frame.offset.y,
-                r.w * cam.zoom,
-                r.h * cam.zoom,
-            )
-        };
         let world_draws: Vec<Draw> = self
             .world
             .as_ref()
             .map(|w| {
                 w.draws
                     .iter()
-                    .filter_map(|(range, clip, blend, image)| {
+                    .filter_map(|(range, clip, blend, image, layer)| {
+                        let l = frame.layer(*layer as usize);
+                        let cam = l.camera;
                         let sc = match clip {
-                            Some(c) => vp.intersection(&to_screen(c))?,
-                            None => vp,
+                            Some(r) => l.clip.intersection(&Rect::new(
+                                (r.x - cam.pan.x) * cam.zoom + frame.offset.x,
+                                (r.y - cam.pan.y) * cam.zoom + frame.offset.y,
+                                r.w * cam.zoom,
+                                r.h * cam.zoom,
+                            ))?,
+                            None => l.clip,
                         };
                         Some(Draw {
                             range: range.clone(),
                             clip: Some(sc),
                             blend: *blend,
                             image: image.clone(),
-                            world: true,
+                            layer: Some(*layer),
                         })
                     })
                     .collect()
@@ -834,7 +876,7 @@ impl CanvasRenderer {
         pass.set_bind_group(3, &self.params_bg, &[]);
         let mut current_pipeline = usize::MAX;
         for d in under.iter().chain(&world_draws).chain(&over) {
-            let (vb, ib) = if d.world {
+            let (vb, ib) = if d.layer.is_some() {
                 match self
                     .world
                     .as_ref()
@@ -870,10 +912,9 @@ impl CanvasRenderer {
             }
             pass.set_bind_group(
                 0,
-                if d.world {
-                    &self.world_bg
-                } else {
-                    &self.screen_bg
+                match d.layer {
+                    Some(l) => &self.world_globals[l as usize].1,
+                    None => &self.screen_bg,
                 },
                 &[],
             );

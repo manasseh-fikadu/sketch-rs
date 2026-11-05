@@ -94,6 +94,18 @@ pub struct Item {
     /// so the GPU scissors first and only feathers the corners.
     pub round_clip: u32,
     pub blend: BlendMode,
+    /// Index into [`CanvasFrame::layers`] (0 when the frame has none).
+    pub layer: u16,
+}
+
+/// A separate view onto a frame's world items: moving one (a fixed header against a scrolling
+/// page, a screen sliding in) only changes a uniform, so no geometry is rebuilt or uploaded.
+#[derive(Debug, Clone, Copy)]
+pub struct RenderLayer {
+    pub camera: Camera,
+    pub opacity: f64,
+    /// Target-space scissor, logical px.
+    pub clip: Rect,
 }
 
 struct Entry {
@@ -214,6 +226,7 @@ impl SceneCache {
                     clip,
                     round_clip: scope.round,
                     blend: n.style.blend,
+                    layer: 0,
                 });
             }
         }
@@ -260,6 +273,19 @@ pub struct CanvasFrame {
     pub offset: V2,
     /// Canvas rect in logical px (world items are scissored to it).
     pub viewport: Rect,
+    /// Views for items to draw through. Empty: every item uses `camera` and `viewport`.
+    pub layers: Vec<RenderLayer>,
+}
+
+impl CanvasFrame {
+    /// The view items of layer `i` draw through.
+    pub fn layer(&self, i: usize) -> RenderLayer {
+        self.layers.get(i).copied().unwrap_or(RenderLayer {
+            camera: self.camera,
+            opacity: 1.0,
+            clip: self.viewport,
+        })
+    }
 }
 
 /// Draw text with its box's top-left at `origin` (screen px) at screen scale `z`.
@@ -646,6 +672,7 @@ pub fn canvas(ed: &Editor, cache: &mut SceneCache, offset: V2, show_grid: bool) 
         camera: ed.camera,
         offset,
         viewport: v.canvas_rect(),
+        layers: Vec::new(),
     }
 }
 
@@ -669,5 +696,6 @@ pub fn export_frame(
         camera,
         offset: V2::ZERO,
         viewport: Rect::new(0.0, 0.0, size_px.x, size_px.y),
+        layers: Vec::new(),
     }
 }
