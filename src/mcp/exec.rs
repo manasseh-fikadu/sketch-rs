@@ -9,12 +9,14 @@
 use super::css::{self, Context, Styles};
 use super::html::{self, Element, Html};
 use super::{Out, ToolResult, tools};
-use crate::editor::Editor;
+use crate::editor::{Button, Editor, InputEvent};
 use crate::geom::{Rect, V2, v2};
 use crate::history::Tx;
 use crate::model::{
-    AutoLayout, Binding, Color, Direction, Document, Head, ImageMode, LayoutMode, Node, NodeId,
-    NodeKind, Paint, PathPoint, Route, Sizing, SubPath, TextAlign,
+    AutoLayout, Binding, Color, Direction, Document, Easing, Head, ImageMode, Interaction,
+    LayoutMode, Node, NodeId, NodeKind, Overflow, OverlayPlacement, Paint, PathPoint, ProtoAction,
+    Route, ScrollPosition, Sizing, SlideDir, StateStyle, SubPath, Target, TextAlign, Transition,
+    TransitionKind, Trigger,
 };
 use crate::project::{Project, Store};
 use crate::render::gpu::Headless;
@@ -282,6 +284,9 @@ pub fn call(host: &mut dyn Host, name: &str, args: &Value) -> ToolResult {
                 "duplicate_nodes" => duplicate_nodes(ed, &a),
                 "move_nodes" => move_nodes(ed, &a),
                 "select_nodes" => select_nodes(ed, &a),
+                "set_interactions" => set_interactions(ed, &a),
+                "get_interactions" => get_interactions(ed, &a),
+                "preview" => preview_tool(host, &a),
                 "undo" | "redo" => undo_redo(ed, &a, name == "undo"),
                 "finish_working_on_nodes" => {
                     host.save()?;
@@ -551,6 +556,9 @@ fn node_info(ed: &mut Editor, a: &Args) -> ToolResult {
         v["instance"] = json!(true);
     }
     v["autoLayout"] = json!(n.layout.is_some());
+    if n.proto.is_some() {
+        v["prototype"] = proto_json(ed, page, n);
+    }
     text(v)
 }
 
@@ -864,9 +872,11 @@ fn guide(a: &Args) -> ToolResult {
         | "instructions" => tools::GUIDE_INSTRUCTIONS,
         "html" | "write_html" => tools::GUIDE_HTML,
         "whiteboard" | "excalidraw" => tools::GUIDE_WHITEBOARD,
+        "prototype" | "preview" => tools::GUIDE_PROTOTYPE,
         _ => {
             return Err(format!(
-                "unknown topic `{t}`; topics: sketch-rs-mcp-instructions, html, whiteboard"
+                "unknown topic `{t}`; topics: sketch-rs-mcp-instructions, html, whiteboard, \
+                 prototype"
             ));
         }
     };
@@ -1525,9 +1535,95 @@ struct Builder<'t, 'a> {
     page_id: String,
     ignored: BTreeSet<String>,
     warnings: Vec<String>,
+    /// `href`s to resolve once everything in this call exists.
+    links: Vec<(NodeId, String)>,
+    /// Layers a `#name` link can point at: their `id` or `layer-name`.
+    anchors: HashMap<String, NodeId>,
 }
 
 impl Builder<'_, '_> {
+    /// What an element asks of the prototype: `href`, `id` to link to, and `data-hover` /
+    /// `data-pressed` styles. `flows`: inline links inside it landed in this same text layer.
+    fn prototype_attrs(&mut self, el: &Element, id: NodeId, flows: bool) {
+        let mut hrefs = Vec::new();
+        collect_hrefs(el, flows, &mut hrefs);
+        hrefs.dedup();
+        if let Some(h) = hrefs.first() {
+            if hrefs.len() > 1 {
+                self.warnings.push(format!(
+                    "a text layer can only link to one place, so it links to `{h}`; put each link \
+                     in its own flex item to link them separately"
+                ));
+            }
+            self.links.push((id, h.clone()));
+        }
+        for name in [el.attr("id"), el.attr("layer-name")].into_iter().flatten() {
+            self.anchors.insert(normalize_link(name), id);
+        }
+        for (attr, hover) in [("data-hover", true), ("data-pressed", false)] {
+            let Some(css_text) = el.attr(attr) else {
+                continue;
+            };
+            let (st, unknown) = state_from_css(&css::parse_inline(css_text));
+            for u in unknown {
+                self.ignored.insert(format!("{attr}: {u}"));
+            }
+            if !st.is_empty()
+                && let Some(n) = self.tx.node_mut(id)
+            {
+                n.edit_proto(|p| {
+                    if hover {
+                        p.hover = Some(st);
+                    } else {
+                        p.pressed = Some(st);
+                    }
+                });
+            }
+        }
+    }
+
+    /// Turn the `href`s seen in this call into interactions.
+    fn finish_links(&mut self, index: &[LinkPage], page: usize) {
+        for (id, href) in std::mem::take(&mut self.links) {
+            let href = href.trim();
+            if href.is_empty() || href == "#" {
+                continue;
+            }
+            let action = if crate::preview::is_safe_url(href) {
+                Some(ProtoAction::OpenUrl { url: href.into() })
+            } else if let Some(a) = self.anchors.get(&normalize_link(href)) {
+                Some(ProtoAction::Navigate {
+                    target: Target::same_page(*a),
+                    transition: Transition::default(),
+                })
+            } else {
+                let width = artboard_of(self.tx.doc(), id)
+                    .and_then(|f| self.tx.doc().get(f))
+                    .map_or(0.0, |n| n.rect.w);
+                find_named_target(index, page, href, width).map(|target| ProtoAction::Navigate {
+                    target,
+                    transition: Transition::default(),
+                })
+            };
+            let Some(action) = action else {
+                self.warnings.push(format!(
+                    "link `{href}` goes nowhere: no page, frame or layer has that name yet, and \
+                     it isn't an http, https, mailto or tel URL; set it later with \
+                     set_interactions"
+                ));
+                continue;
+            };
+            if let Some(n) = self.tx.node_mut(id) {
+                n.edit_proto(|p| {
+                    p.interactions.push(Interaction {
+                        trigger: Trigger::Click,
+                        action,
+                    })
+                });
+            }
+        }
+    }
+
     fn insert(&mut self, n: Node, parent: &Parent, index: &mut Option<usize>) -> NodeId {
         let id = self.tx.insert(n, parent.id, *index);
         if let Some(i) = index {
@@ -1804,6 +1900,7 @@ impl Builder<'_, '_> {
         n.text_style.normalize();
         let keep_h = get(own, "height").is_some_and(|v| css::length(v, fs).is_some());
         let id = self.insert(n, parent, index);
+        self.prototype_attrs(el, id, true);
         fit_text(self.tx, id, keep_h);
         self.place(id, &a, parent);
         Some(id)
@@ -1923,6 +2020,7 @@ impl Builder<'_, '_> {
             }
         }
         let id = self.insert(n, parent, index);
+        self.prototype_attrs(el, id, false);
         remember_stretch(&self.page_id, id, own);
         let me = Parent::of(self.tx.doc(), &self.page_id, Some(id));
         let inh = inherit(inherited, own);
@@ -2266,6 +2364,7 @@ fn write_html(ed: &mut Editor, a: &Args) -> ToolResult {
     }
     let tree = html::parse(src);
     let page_id = ed.pages[page].id.clone();
+    let link_index = link_index(ed);
     let (created, ignored, warnings) = ed.with_page(page, |ed| {
         ed.edit("Write HTML", |tx| {
             // Where the new content goes.
@@ -2294,9 +2393,12 @@ fn write_html(ed: &mut Editor, a: &Args) -> ToolResult {
                 page_id: page_id.clone(),
                 ignored: BTreeSet::new(),
                 warnings: Vec::new(),
+                links: Vec::new(),
+                anchors: HashMap::new(),
             };
             let flex = parent.layout.is_some_and(|l| l.mode != LayoutMode::Block);
             let made = b.nodes(&tree, &inherited, &parent, &mut index, flex);
+            b.finish_links(&link_index, page);
             // Root-level content without a position goes where the replaced node was, or
             // into free space.
             if parent_id.is_none() {
@@ -2901,6 +3003,633 @@ fn undo_redo(ed: &mut Editor, a: &Args, undo: bool) -> ToolResult {
         (ed.history.generation() != before).then(|| ed.status.clone())
     });
     text(json!({"done": label.is_some(), "what": label}))
+}
+
+// ------------------------------------------------------------------------------ prototype
+
+/// Every page's frames, for finding link targets by name.
+struct LinkPage {
+    id: String,
+    name: String,
+    frames: Vec<(NodeId, String, f64)>,
+}
+
+fn link_index(ed: &Editor) -> Vec<LinkPage> {
+    ed.pages
+        .iter()
+        .enumerate()
+        .map(|(i, slot)| {
+            let doc = ed.page_doc(i);
+            LinkPage {
+                id: slot.id.clone(),
+                name: slot.name.clone(),
+                frames: doc
+                    .root
+                    .iter()
+                    .filter_map(|id| doc.get(*id))
+                    .filter(|n| n.is_frame())
+                    .map(|n| (n.id, n.name.clone(), n.rect.w))
+                    .collect(),
+            }
+        })
+        .collect()
+}
+
+/// `#About`, `/about`, `about.html` and `About` all mean the same thing in a link.
+fn normalize_link(s: &str) -> String {
+    let s = s.trim().trim_start_matches(['#', '.', '/']);
+    let s = s.strip_suffix(".html").unwrap_or(s);
+    s.trim_end_matches('/').trim().to_lowercase()
+}
+
+/// Find a link target by name: a frame on this page, a page (its frame closest to `width`, so
+/// desktop links reach desktop screens and mobile links mobile ones), "Page / Frame", or a frame
+/// on any page.
+fn find_named_target(index: &[LinkPage], from: usize, name: &str, width: f64) -> Option<Target> {
+    let q = normalize_link(name);
+    if q.is_empty() {
+        return None;
+    }
+    let same = |a: &str| normalize_link(a) == q;
+    let target = |i: usize, node: NodeId| Target {
+        page: (i != from).then(|| index[i].id.clone()),
+        node,
+    };
+    if let Some(f) = index.get(from)?.frames.iter().find(|f| same(&f.1)) {
+        return Some(target(from, f.0));
+    }
+    if let Some(i) = index.iter().position(|p| same(&p.name)) {
+        let best = index[i]
+            .frames
+            .iter()
+            .min_by(|a, b| (a.2 - width).abs().total_cmp(&(b.2 - width).abs()))?;
+        return Some(target(i, best.0));
+    }
+    if let Some((p, f)) = name.split_once('/').map(|(p, f)| (normalize_link(p), f))
+        && let Some(i) = index.iter().position(|pg| normalize_link(&pg.name) == p)
+        && let Some(found) = index[i]
+            .frames
+            .iter()
+            .find(|x| normalize_link(&x.1) == normalize_link(f))
+    {
+        return Some(target(i, found.0));
+    }
+    index.iter().enumerate().find_map(|(i, pg)| {
+        pg.frames
+            .iter()
+            .find(|f| same(&f.1))
+            .map(|f| target(i, f.0))
+    })
+}
+
+fn collect_hrefs(el: &Element, descend: bool, out: &mut Vec<String>) {
+    if let Some(h) = el.attr("href") {
+        out.push(h.to_string());
+    }
+    if descend {
+        for c in &el.children {
+            if let Html::Element(e) = c {
+                collect_hrefs(e, true, out);
+            }
+        }
+    }
+}
+
+/// CSS for a hover or pressed state. Returns what it couldn't use.
+fn state_from_css(styles: &[(String, String)]) -> (StateStyle, Vec<String>) {
+    let mut st = StateStyle::default();
+    let mut unknown = Vec::new();
+    for (k, v) in styles {
+        let ok = match k.as_str() {
+            "backgroundColor" | "background" | "fill" => {
+                st.fill = css::color(v);
+                st.fill.is_some()
+            }
+            "color" => {
+                st.text = css::color(v);
+                st.text.is_some()
+            }
+            "borderColor" | "stroke" => {
+                st.stroke = css::color(v);
+                st.stroke.is_some()
+            }
+            "opacity" => {
+                st.opacity = v.trim().parse().ok();
+                st.opacity.is_some()
+            }
+            "transform" => match css::translation(v, 16.0) {
+                Some(t) => {
+                    st.offset = Some(v2(t[0], t[1]));
+                    true
+                }
+                None => false,
+            },
+            _ => false,
+        };
+        if !ok {
+            unknown.push(format!("{k}: {v}"));
+        }
+    }
+    (st, unknown)
+}
+
+fn parse_transition(v: Option<&Value>) -> Result<Transition, String> {
+    let mut t = Transition::default();
+    let Some(v) = v.filter(|v| !v.is_null()) else {
+        return Ok(t);
+    };
+    let kind = v.as_str().or_else(|| v.get("type").and_then(Value::as_str));
+    if let Some(k) = kind {
+        t.kind = match k {
+            "instant" | "none" => TransitionKind::Instant,
+            "dissolve" | "fade" => TransitionKind::Dissolve,
+            "move_in" | "slide" | "slide_in" => TransitionKind::MoveIn,
+            "push" => TransitionKind::Push,
+            o => {
+                return Err(format!(
+                    "transition type `{o}`: use instant, dissolve, slide or push"
+                ));
+            }
+        };
+    }
+    if let Some(d) = v.get("direction").and_then(Value::as_str) {
+        t.dir = match d {
+            "left" => SlideDir::Left,
+            "right" => SlideDir::Right,
+            "up" => SlideDir::Up,
+            "down" => SlideDir::Down,
+            o => {
+                return Err(format!(
+                    "transition direction `{o}`: use left, right, up or down"
+                ));
+            }
+        };
+    }
+    if let Some(e) = v.get("easing").and_then(Value::as_str) {
+        t.easing = match e {
+            "linear" => Easing::Linear,
+            "ease-in" | "ease_in" => Easing::EaseIn,
+            "ease-out" | "ease_out" => Easing::EaseOut,
+            "ease-in-out" | "ease_in_out" => Easing::EaseInOut,
+            o => {
+                return Err(format!(
+                    "easing `{o}`: use linear, ease-in, ease-out or ease-in-out"
+                ));
+            }
+        };
+    }
+    if let Some(ms) = v.get("duration").and_then(Value::as_f64) {
+        t.ms = ms.max(0.0);
+    }
+    Ok(t)
+}
+
+/// A target given as a node id or a name (see [`find_named_target`]).
+fn parse_target(ed: &Editor, v: &Value, page: usize, width: f64) -> Result<Target, String> {
+    let key = v
+        .as_str()
+        .ok_or("an interaction needs a `target`: a node id or the name of a page or frame")?;
+    if let Ok((p, node)) = resolve(ed, key, page) {
+        return Ok(Target {
+            page: (p != page).then(|| ed.pages[p].id.clone()),
+            node,
+        });
+    }
+    find_named_target(&link_index(ed), page, key, width).ok_or_else(|| {
+        format!(
+            "no node, page or frame called `{key}`; pages are {}",
+            ed.pages
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })
+}
+
+fn parse_interaction(
+    ed: &Editor,
+    v: &Value,
+    page: usize,
+    width: f64,
+) -> Result<Interaction, String> {
+    let s = |k: &str| v.get(k).and_then(Value::as_str);
+    let trigger = match s("trigger").unwrap_or("click") {
+        "click" => Trigger::Click,
+        "hover" => Trigger::Hover,
+        "delay" => Trigger::Delay {
+            ms: v.get("delay").and_then(Value::as_f64).unwrap_or(1000.0),
+        },
+        o => return Err(format!("trigger `{o}`: use click, hover or delay")),
+    };
+    let target = v.get("target").unwrap_or(&Value::Null);
+    let transition = parse_transition(v.get("transition"))?;
+    let action = match s("action").ok_or("an interaction needs an `action`")? {
+        "navigate" => ProtoAction::Navigate {
+            target: parse_target(ed, target, page, width)?,
+            transition,
+        },
+        "back" => ProtoAction::Back,
+        "open_overlay" => ProtoAction::OpenOverlay {
+            target: parse_target(ed, target, page, width)?,
+            placement: match s("placement").unwrap_or("center") {
+                "center" => OverlayPlacement::Center,
+                "below" => OverlayPlacement::Below,
+                "top_left" => OverlayPlacement::TopLeft,
+                "top_center" => OverlayPlacement::TopCenter,
+                "top_right" => OverlayPlacement::TopRight,
+                "bottom_left" => OverlayPlacement::BottomLeft,
+                "bottom_center" => OverlayPlacement::BottomCenter,
+                "bottom_right" => OverlayPlacement::BottomRight,
+                o => return Err(format!("placement `{o}` isn't known")),
+            },
+            dim: v.get("dim").and_then(Value::as_bool).unwrap_or(true),
+            close_outside: v
+                .get("closeOutside")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+            transition,
+        },
+        "close_overlay" => ProtoAction::CloseOverlay,
+        "open_url" => {
+            let url = s("url").ok_or("open_url needs a `url`")?;
+            if !crate::preview::is_safe_url(url) {
+                return Err(format!("`{url}`: links must be http, https, mailto or tel"));
+            }
+            ProtoAction::OpenUrl { url: url.into() }
+        }
+        o => {
+            return Err(format!(
+                "action `{o}`: use navigate, back, open_overlay, close_overlay or open_url"
+            ));
+        }
+    };
+    Ok(Interaction { trigger, action })
+}
+
+/// One `set_interactions` update, ready to apply. Outer `None`: leave that setting alone.
+struct ProtoPatch {
+    interactions: Option<Vec<Interaction>>,
+    hover: Option<Option<StateStyle>>,
+    pressed: Option<Option<StateStyle>>,
+    position: Option<ScrollPosition>,
+    overflow: Option<Overflow>,
+}
+
+fn parse_state(v: &Value) -> Result<Option<StateStyle>, String> {
+    if v.is_null() {
+        return Ok(None);
+    }
+    let (st, unknown) = state_from_css(&css::from_json(v)?);
+    if !unknown.is_empty() {
+        return Err(format!(
+            "can't use {}; a state takes backgroundColor, color, borderColor, opacity and \
+             transform",
+            unknown.join(", ")
+        ));
+    }
+    Ok(Some(st))
+}
+
+fn set_interactions(ed: &mut Editor, a: &Args) -> ToolResult {
+    let def = page_arg(ed, a)?;
+    // Check everything first, so a mistake in one update changes nothing.
+    let mut jobs: Vec<(usize, NodeId, ProtoPatch)> = Vec::new();
+    for u in a.arr("updates")? {
+        let key = u
+            .get("nodeId")
+            .and_then(Value::as_str)
+            .ok_or("each update needs a nodeId")?;
+        let (page, id) = resolve(ed, key, def)?;
+        let doc = ed.page_doc(page);
+        let width = artboard_of(doc, id)
+            .and_then(|f| doc.get(f))
+            .map_or(0.0, |n| n.rect.w);
+        let interactions = match u.get("interactions").filter(|v| !v.is_null()) {
+            Some(list) => Some(
+                list.as_array()
+                    .ok_or("interactions must be an array")?
+                    .iter()
+                    .map(|v| parse_interaction(ed, v, page, width))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+            None => None,
+        };
+        let position = match u.get("position").and_then(Value::as_str) {
+            None => None,
+            Some("scroll" | "static") => Some(ScrollPosition::Scrolls),
+            Some("fixed") => Some(ScrollPosition::Fixed),
+            Some("sticky") => Some(ScrollPosition::Sticky),
+            Some(o) => return Err(format!("position `{o}`: use scroll, fixed or sticky")),
+        };
+        let overflow = match u.get("overflow").and_then(Value::as_str) {
+            None => None,
+            Some("none") => Some(Overflow::None),
+            Some("vertical") => Some(Overflow::Vertical),
+            Some("horizontal") => Some(Overflow::Horizontal),
+            Some("both") => Some(Overflow::Both),
+            Some(o) => {
+                return Err(format!(
+                    "overflow `{o}`: use none, vertical, horizontal or both"
+                ));
+            }
+        };
+        jobs.push((
+            page,
+            id,
+            ProtoPatch {
+                interactions,
+                hover: u.get("hover").map(parse_state).transpose()?,
+                pressed: u.get("pressed").map(parse_state).transpose()?,
+                position,
+                overflow,
+            },
+        ));
+    }
+    let count = jobs.len();
+    let mut pages: Vec<usize> = jobs.iter().map(|j| j.0).collect();
+    pages.sort_unstable();
+    pages.dedup();
+    for page in pages {
+        let here: Vec<&(usize, NodeId, ProtoPatch)> = jobs.iter().filter(|j| j.0 == page).collect();
+        ed.with_page(page, |ed| {
+            ed.begin("Set interactions");
+            {
+                let mut tx = ed.tx();
+                for (_, id, patch) in &here {
+                    let Some(n) = tx.node_mut(*id) else { continue };
+                    n.edit_proto(|p| {
+                        if let Some(v) = &patch.interactions {
+                            p.interactions = v.clone();
+                        }
+                        if let Some(v) = patch.hover {
+                            p.hover = v;
+                        }
+                        if let Some(v) = patch.pressed {
+                            p.pressed = v;
+                        }
+                        if let Some(v) = patch.position {
+                            p.position = v;
+                        }
+                        if let Some(v) = patch.overflow {
+                            p.overflow = v;
+                        }
+                    });
+                    // Scrolling content has to be cut off at the frame's edge.
+                    if patch.overflow.is_some_and(|o| o != Overflow::None)
+                        && let NodeKind::Frame { clip } = &mut n.kind
+                    {
+                        *clip = true;
+                    }
+                }
+            }
+            let ids: Vec<NodeId> = here.iter().map(|j| j.1).collect();
+            ed.mark_overrides(&ids, "prototype");
+            ed.commit();
+        });
+    }
+    text(json!({"updated": count}))
+}
+
+fn target_json(ed: &Editor, page: usize, t: &Target) -> Value {
+    match ed.resolve_target(&ed.pages[page].id, t) {
+        Some(r) => {
+            let doc = ed.page_doc(r.page_index);
+            json!({
+                "id": node_key(ed, r.page_index, r.node),
+                "name": doc.get(r.node).map(|n| n.name.as_str()),
+                "page": ed.pages[r.page_index].name,
+                "screen": doc.get(r.frame).map(|n| n.name.as_str()),
+            })
+        }
+        None => json!({"missing": true}),
+    }
+}
+
+fn proto_json(ed: &Editor, page: usize, n: &Node) -> Value {
+    let Some(p) = n.proto.as_deref() else {
+        return Value::Null;
+    };
+    let interactions: Vec<Value> = p
+        .interactions
+        .iter()
+        .map(|i| {
+            let mut v = serde_json::to_value(i).unwrap_or(Value::Null);
+            if let Some(t) = i.action.target() {
+                v["target"] = target_json(ed, page, t);
+            }
+            v
+        })
+        .collect();
+    let mut v = json!({"interactions": interactions});
+    if let Some(h) = p.hover {
+        v["hover"] = serde_json::to_value(h).unwrap_or(Value::Null);
+    }
+    if let Some(h) = p.pressed {
+        v["pressed"] = serde_json::to_value(h).unwrap_or(Value::Null);
+    }
+    if p.position != ScrollPosition::Scrolls {
+        v["position"] = serde_json::to_value(p.position).unwrap_or(Value::Null);
+    }
+    if p.overflow != Overflow::None {
+        v["overflow"] = serde_json::to_value(p.overflow).unwrap_or(Value::Null);
+    }
+    v
+}
+
+fn get_interactions(ed: &mut Editor, a: &Args) -> ToolResult {
+    let pages: Vec<usize> = match a.str("pageId").filter(|p| !p.is_empty()) {
+        Some(p) => vec![find_page(ed, p)?],
+        None => (0..ed.pages.len()).collect(),
+    };
+    let mut out = Vec::new();
+    for page in pages {
+        let doc = ed.page_doc(page);
+        for id in doc.paint_order() {
+            let Some(n) = doc.get(id).filter(|n| n.proto.is_some()) else {
+                continue;
+            };
+            let mut v = proto_json(ed, page, n);
+            v["id"] = json!(node_key(ed, page, id));
+            v["name"] = json!(n.name);
+            v["page"] = json!(ed.pages[page].name);
+            out.push(v);
+        }
+    }
+    text(json!({"layers": out}))
+}
+
+fn preview_state(ed: &Editor) -> Value {
+    let Some(p) = &ed.preview else {
+        return json!({"running": false});
+    };
+    let s = &p.current;
+    let i = ed.pages.iter().position(|pg| pg.id == s.page);
+    let name = i
+        .and_then(|i| ed.page_doc(i).get(s.frame))
+        .map(|n| n.name.clone());
+    json!({
+        "running": true,
+        "page": i.map(|i| ed.pages[i].name.clone()),
+        "screen": name,
+        "screenId": i.map(|i| node_key(ed, i, s.frame)),
+        "scrollY": r2(s.scroll.y),
+        "overlays": p.overlays.len(),
+        "canGoBack": p.can_go_back(),
+    })
+}
+
+/// Names of the layers under a canvas position, frontmost first.
+fn under_pointer(ed: &Editor, pos: V2) -> Vec<String> {
+    let Some(p) = &ed.preview else {
+        return Vec::new();
+    };
+    match p.pick(pos) {
+        crate::preview::Hit::Layer { page, chain, .. } => {
+            let i = ed.pages.iter().position(|pg| pg.id == page);
+            chain
+                .iter()
+                .filter_map(|id| i.and_then(|i| ed.page_doc(i).get(*id)))
+                .map(|n| n.name.clone())
+                .collect()
+        }
+        crate::preview::Hit::Backdrop(_) => vec!["(overlay backdrop)".into()],
+        crate::preview::Hit::Stage => vec!["(stage)".into()],
+    }
+}
+
+/// The preview as it is right now, rendered offscreen.
+fn preview_screenshot(host: &mut dyn Host, a: &Args) -> ToolResult {
+    let gpu = host
+        .gpu()
+        .ok_or("screenshots need a GPU and none is available")?;
+    let ed = host.editor();
+    ed.preview_sync();
+    let Some(p) = ed.preview.as_deref() else {
+        return Err("the preview isn't running; call preview with action \"start\"".into());
+    };
+    let scale = a.num("scale").unwrap_or(1.0).clamp(0.5, 2.0);
+    let vp = ed.viewport;
+    let size = [(vp.x * scale) as u32, (vp.y * scale) as u32];
+    let frame = crate::preview::render::frame(p, &mut Default::default(), V2::ZERO);
+    let img = gpu.render_frame(&frame, size, scale as f32, [0.0, 0.0, 0.0, 1.0]);
+    let mut buf = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut buf, image::ImageFormat::Png)
+        .map_err(|e| e.to_string())?;
+    Ok(vec![
+        Out::Image {
+            data: buf.into_inner(),
+            mime: "image/png".into(),
+        },
+        Out::Text(preview_state(ed).to_string()),
+    ])
+}
+
+/// Lets an agent start the preview for the user, or test links without a pointer.
+fn preview_tool(host: &mut dyn Host, a: &Args) -> ToolResult {
+    let action = a.req_str("action")?;
+    if action == "screenshot" {
+        return preview_screenshot(host, a);
+    }
+    let ed = host.editor();
+    let def = page_arg(ed, a)?;
+    match action {
+        "start" => {
+            let at = a
+                .str("nodeId")
+                .map(|key| {
+                    let (page, id) = resolve(ed, key, def)?;
+                    let doc = ed.page_doc(page);
+                    artboard_of(doc, id)
+                        .map(|f| (page, f))
+                        .ok_or_else(|| format!("`{key}` isn't inside a frame"))
+                })
+                .transpose()?;
+            if !ed.start_preview(at) {
+                return Err(ed.status.clone());
+            }
+        }
+        "stop" => ed.stop_preview(),
+        "status" => {}
+        action => {
+            if ed.preview.is_none() {
+                return Err("the preview isn't running; call preview with action \"start\"".into());
+            }
+            match action {
+                // A position goes through hit testing, like a real pointer, so it also shows
+                // whether anything is covering the layer.
+                "click" | "hover" if a.num("x").is_some() => {
+                    let pos = v2(a.num("x").unwrap_or(0.0), a.num("y").unwrap_or(0.0));
+                    let time_ms = ed.now_ms;
+                    ed.handle(InputEvent::PointerMove {
+                        pos,
+                        pressure: None,
+                        time_ms,
+                    });
+                    let hit = under_pointer(ed, pos);
+                    if action == "click" {
+                        for down in [true, false] {
+                            ed.handle(if down {
+                                InputEvent::PointerDown {
+                                    pos,
+                                    button: Button::Primary,
+                                    pressure: None,
+                                    time_ms,
+                                }
+                            } else {
+                                InputEvent::PointerUp {
+                                    pos,
+                                    button: Button::Primary,
+                                    time_ms,
+                                }
+                            });
+                        }
+                    }
+                    let mut v = preview_state(ed);
+                    v["under"] = json!(hit);
+                    ed.revision += 1;
+                    return text(v);
+                }
+                "scroll" => {
+                    let delta = v2(a.num("x").unwrap_or(0.0), a.num("y").unwrap_or(0.0));
+                    let vp = ed.viewport;
+                    let pos = vp * 0.5;
+                    ed.handle(InputEvent::Scroll { delta, pos });
+                }
+                "click" => {
+                    let (page, node) = resolve(ed, a.req_str("nodeId")?, def)?;
+                    let r = crate::preview::NodeRef {
+                        page: ed.pages[page].id.clone(),
+                        node,
+                    };
+                    ed.with_preview(|p, ed| {
+                        p.click(ed, &r);
+                        p.sync(ed);
+                    });
+                }
+                "back" => {
+                    ed.with_preview(|p, ed| {
+                        p.back(ed);
+                        p.sync(ed);
+                    });
+                }
+                "restart" => {
+                    ed.with_preview(|p, ed| {
+                        p.restart(ed);
+                        p.sync(ed);
+                    });
+                }
+                o => {
+                    return Err(format!(
+                        "action `{o}`: use start, stop, status, click, hover, scroll, back, \
+                         restart or screenshot"
+                    ));
+                }
+            }
+        }
+    }
+    ed.revision += 1;
+    text(preview_state(ed))
 }
 
 #[cfg(test)]

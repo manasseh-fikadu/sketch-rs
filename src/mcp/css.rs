@@ -13,8 +13,8 @@ use crate::geom::v2;
 use crate::model::rough::{FillStyle, Rough};
 use crate::model::{
     Align, AutoLayout, BlendMode, BorderSide, Color, CssAngle, Dim, Direction, Distribute, GridPos,
-    GridSpec, ImageMode, LayoutMode, Node, NodeKind, Paint, SelfAlign, Shadow, Sizing, Stop,
-    TextAlign,
+    GridSpec, ImageMode, LayoutMode, Node, NodeKind, Overflow, Paint, ScrollPosition, SelfAlign,
+    Shadow, Sizing, Stop, TextAlign,
 };
 use serde_json::{Map, Value};
 
@@ -291,7 +291,7 @@ pub fn shadows(v: &str, font_size: f64) -> Option<Vec<Shadow>> {
 }
 
 /// A `transform` made only of pixel translations, as an x and y shift.
-fn translation(v: &str, font_size: f64) -> Option<[f64; 2]> {
+pub fn translation(v: &str, font_size: f64) -> Option<[f64; 2]> {
     if v.trim().eq_ignore_ascii_case("none") {
         return Some([0.0; 2]);
     }
@@ -960,6 +960,14 @@ pub fn apply(n: &mut Node, styles: &[(String, String)], ctx: &Context) -> Applie
                     "absolute" | "fixed" => n.layout_child.absolute = true,
                     _ => n.layout_child.absolute = false,
                 }
+                // The canvas lays both out as CSS would at scroll 0; the preview does the rest.
+                n.edit_proto(|p| {
+                    p.position = match lower.as_str() {
+                        "fixed" => ScrollPosition::Fixed,
+                        "sticky" => ScrollPosition::Sticky,
+                        _ => ScrollPosition::Scrolls,
+                    }
+                });
                 true
             }
             "display" => match lower.as_str() {
@@ -1319,6 +1327,36 @@ pub fn apply(n: &mut Node, styles: &[(String, String)], ctx: &Context) -> Applie
                 if let NodeKind::Frame { clip } = &mut n.kind {
                     *clip = matches!(lower.as_str(), "hidden" | "clip" | "scroll" | "auto");
                 }
+                let scrolls = matches!(lower.as_str(), "scroll" | "auto");
+                n.edit_proto(|p| {
+                    p.overflow = if scrolls {
+                        Overflow::Both
+                    } else {
+                        Overflow::None
+                    }
+                });
+                true
+            }
+            "overflowX" | "overflowY" if n.is_frame() => {
+                let scrolls = matches!(lower.as_str(), "scroll" | "auto");
+                if let NodeKind::Frame { clip } = &mut n.kind {
+                    *clip = *clip || scrolls || matches!(lower.as_str(), "hidden" | "clip");
+                }
+                let x = k == "overflowX";
+                n.edit_proto(|p| {
+                    let (mut sx, mut sy) = (p.overflow.x(), p.overflow.y());
+                    if x {
+                        sx = scrolls;
+                    } else {
+                        sy = scrolls;
+                    }
+                    p.overflow = match (sx, sy) {
+                        (true, true) => Overflow::Both,
+                        (true, false) => Overflow::Horizontal,
+                        (false, true) => Overflow::Vertical,
+                        (false, false) => Overflow::None,
+                    };
+                });
                 true
             }
             "backgroundColor" | "background" | "backgroundImage" | "fill" if !is_text => {
@@ -1921,7 +1959,16 @@ pub fn computed(n: &Node, parent_layout: Option<&AutoLayout>, is_root: bool) -> 
         }
     }
     if let NodeKind::Frame { clip: true } = n.kind {
-        put("overflow", "hidden".into());
+        let ov = n.proto.as_ref().map_or(Overflow::None, |p| p.overflow);
+        put(
+            "overflow",
+            if ov == Overflow::None {
+                "hidden"
+            } else {
+                "auto"
+            }
+            .into(),
+        );
     }
     if !n.visible {
         put("display", "none".into());

@@ -22,6 +22,8 @@ ignoredStyles lists any CSS that had no effect, so read it and adjust.
 - Edit with update_styles, set_text_content, rename_nodes, duplicate_nodes, move_nodes, \
 delete_nodes. Whiteboard shapes, sticky notes and arrows: create_shape. Hand-drawn style: \
 update_styles with {\"sketch\": true, \"roughness\": 1, \"fillStyle\": \"hachure\"}.
+- Make designs behave like a real site with set_interactions, then play them with preview; see \
+get_guide({ topic: \"prototype\" }).
 - Check your work with get_screenshot. Artboard height is a starting point: when content \
 clips set height: \"fit-content\" with update_styles.
 - Call finish_working_on_nodes when done.";
@@ -239,7 +241,8 @@ pub fn definitions() -> Vec<Value> {
         tool(
             "get_guide",
             "Read a guide. Topics: \"sketch-rs-mcp-instructions\" (read first), \"html\" (what \
-             write_html supports), \"whiteboard\" (shapes, arrows, stickies, hand-drawn style).",
+             write_html supports), \"whiteboard\" (shapes, arrows, stickies, hand-drawn style), \
+             \"prototype\" (links, hover states, scrolling, preview).",
             json!({"topic": {"type": "string"}}),
             &["topic"],
             true,
@@ -319,6 +322,9 @@ pub fn definitions() -> Vec<Value> {
              <svg> markup is imported as vector layers.\n\
              - layer-name=\"...\" names layers; <x-sketch-clone node-id=\"ID\" style=\"...\"/> \
              clones an existing node.\n\
+             - Prototype: <a href> links to a URL, a page or a frame by name, or a #id in this \
+             HTML. data-hover=\"background-color:#123;color:#fff\" and data-pressed style those \
+             states. position:fixed/sticky and overflow:auto/scroll work in the preview.\n\
              Returns the ids of the created top-level layers and the styles that were ignored.",
             json!({
                 "html": {"type": "string", "description": "HTML to parse into layers."},
@@ -443,6 +449,80 @@ pub fn definitions() -> Vec<Value> {
             false,
         ),
         tool(
+            "set_interactions",
+            "Make layers behave like a real site in the prototype preview (batch). Omitted keys \
+             stay as they are; interactions replaces the layer's whole list, [] clears it, and \
+             hover/pressed null clears that state. A target is a node id on any page, or the \
+             name of a page or frame; a page name picks its frame closest in width to the link's \
+             own frame, so desktop links reach desktop screens. A target inside a frame opens \
+             that screen scrolled to it, like a #section link. Read get_guide({topic: \
+             \"prototype\"}) first.",
+            json!({
+                "updates": {"type": "array", "items": {
+                    "type": "object",
+                    "properties": {
+                        "nodeId": {"type": "string"},
+                        "interactions": {"type": "array", "items": {
+                            "type": "object",
+                            "properties": {
+                                "trigger": {"type": "string", "enum": ["click", "hover", "delay"], "description": "Defaults to click."},
+                                "delay": {"type": "number", "description": "Milliseconds, for trigger delay."},
+                                "action": {"type": "string", "enum": ["navigate", "back", "open_overlay", "close_overlay", "open_url"]},
+                                "target": {"type": "string", "description": "For navigate and open_overlay."},
+                                "url": {"type": "string", "description": "For open_url: http, https, mailto or tel."},
+                                "placement": {"type": "string", "enum": ["center", "below", "top_left", "top_center", "top_right", "bottom_left", "bottom_center", "bottom_right"]},
+                                "dim": {"type": "boolean"},
+                                "closeOutside": {"type": "boolean"},
+                                "transition": {"type": "object", "properties": {
+                                    "type": {"type": "string", "enum": ["instant", "dissolve", "slide", "push"]},
+                                    "direction": {"type": "string", "enum": ["left", "right", "up", "down"]},
+                                    "duration": {"type": "number"},
+                                    "easing": {"type": "string", "enum": ["linear", "ease-in", "ease-out", "ease-in-out"]},
+                                }},
+                            },
+                            "required": ["action"],
+                        }},
+                        "hover": styles_schema("CSS while hovered: backgroundColor, color, borderColor, opacity, transform."),
+                        "pressed": styles_schema("CSS while pressed, same keys as hover."),
+                        "position": {"type": "string", "enum": ["scroll", "fixed", "sticky"]},
+                        "overflow": {"type": "string", "enum": ["none", "vertical", "horizontal", "both"]},
+                    },
+                    "required": ["nodeId"],
+                }},
+                "pageId": page_id(),
+            }),
+            &["updates"],
+            false,
+        ),
+        tool(
+            "get_interactions",
+            "Every layer with prototype settings, with where its links go. Links whose target was \
+             deleted say missing: true. Covers the whole project unless pageId is given.",
+            json!({"pageId": page_id()}),
+            &[],
+            true,
+        ),
+        tool(
+            "preview",
+            "Control and test the prototype preview in the user's window. action: start (optional \
+             nodeId picks the frame), stop, status, back, restart, screenshot (PNG of the preview \
+             as it is now). click and hover take x and y in window points below the preview's \
+             bar, go through hit testing like a real pointer, and report the layers `under` it, \
+             so they show whether something covers a link; click with nodeId instead runs that \
+             layer's click interactions directly. scroll takes x and y as pixel deltas. Returns \
+             the screen showing.",
+            json!({
+                "action": {"type": "string", "enum": ["start", "stop", "status", "click", "hover", "scroll", "back", "restart", "screenshot"]},
+                "nodeId": node_id("The frame to start on, or the layer to click."),
+                "x": {"type": "number"},
+                "y": {"type": "number"},
+                "scale": {"type": "number", "description": "For screenshot: 1 (default) or 2."},
+                "pageId": page_id(),
+            }),
+            &["action"],
+            false,
+        ),
+        tool(
             "undo",
             "Undo the last change on a page (the user's or an agent's).",
             json!({"pageId": page_id()}),
@@ -517,6 +597,37 @@ font-weight, font-style, line-height, letter-spacing, text-align, text-decoratio
 text-transform.
 Anything else, such as other font families, z-index, filters or transitions, has no effect and
 is reported back in ignoredStyles.";
+
+pub const GUIDE_PROTOTYPE: &str = "\
+# Prototyping
+
+The preview plays top-level frames as screens of a website, across every page of the project. A
+frame taller than the window scrolls, and scrolling, hovering and clicking work as in a browser.
+
+set_interactions({updates: [{nodeId, ...}]}) sets, for one layer:
+- interactions: [{trigger, action, target, transition}]
+  - navigate: target is a node id on any page, or a page or frame name. A layer inside a frame
+    opens that screen scrolled to it, or just scrolls if that screen is already showing.
+  - back, close_overlay, open_url ({url}).
+  - open_overlay: placement (center, below, top_left, ...), dim, closeOutside. With trigger hover
+    it's a dropdown: it closes when the pointer leaves both the layer and the overlay.
+  - trigger: click (default), hover, or delay with {delay: ms}.
+  - transition: {type: instant|dissolve|slide|push, direction, duration, easing}.
+- hover / pressed: {backgroundColor, color, borderColor, opacity, transform: \"translateY(-2px)\"},
+  like :hover and :active. They apply when the pointer is on the layer or anything inside it, and
+  color reaches text inside it.
+- position: fixed or sticky, for headers. Pinned layers paint over what scrolls under them.
+- overflow: vertical, horizontal or both, for carousels and scrolling panels.
+
+Put a link on the whole button or card, not just its text: a click anywhere inside it counts.
+Check your wiring with get_interactions (deleted targets say missing: true). Test it with
+preview({action: \"start\"}), preview({action: \"click\", nodeId}) and preview({action: \"stop\"}).
+
+In write_html, <a href> makes a link and id=\"x\" makes a target for href=\"#x\". data-hover and
+data-pressed take the same CSS as hover and pressed. CSS position:fixed/sticky and
+overflow:auto/scroll carry over too.
+
+The preview never changes the document. Show it to the user with preview({action: \"start\"}).";
 
 pub const GUIDE_WHITEBOARD: &str = "\
 # Whiteboard elements
